@@ -1,0 +1,117 @@
+# Example configuration for local filesystem output
+# Copy this to config.yml and modify as needed
+
+data_dir: /mnt/fanout/
+
+sources:
+  events:
+    type: kafka
+    topics:
+      - fanout
+    bootstrap_servers: localhost:9092
+    group_id: fanout
+    auto_offset_reset: latest
+    # Sarama memory tuning (optional)
+    # channel_buffer_size: 64
+    # fetch_default_bytes: 262144
+    # fetch_max_bytes: 2097152
+    # max_processing_time_ms: 100
+    tls:
+      enabled: false
+
+sinks:
+  # Local filesystem sink for testing
+  local_events:
+    type: filesystem
+    inputs:
+      - events
+    path: /mnt/parquet_output/
+    key_prefix: events/{{team_id}}/{{date}}/
+    filename_extension: parquet
+    disk_batching:
+      max_events: 10000
+      max_bytes: 104857600  # 100MB
+      timeout_secs: 30
+      # Backpressure configuration (defaults shown)
+      backpressure:
+        max_pending_flushes: 100        # Max flush jobs queued before blocking
+        max_concurrent_flushes: 4       # Parallel flush workers
+        max_open_files: 256             # LRU cache size for buffer file handles
+        max_total_bytes: 53687091200    # 50GB - max buffered before backpressure
+    encoding:
+      codec: parquet
+      parquet:
+        compression: zstd
+        compression_level: 5
+        rows_per_file: 10000
+        allow_nullable_fields: true
+        sorting_columns:
+          - column: event
+            descending: false
+          - column: timestamp
+            descending: false
+        json_columns:
+          - column: properties
+            max_subcolumns: 1024
+            bucket_count: 256
+            max_depth: 10
+            keep_original_column: true
+        schema:
+          uuid:
+            type: utf8
+          event:
+            type: utf8
+
+  # S3 sink example (commented out)
+  # s3_events:
+  #   type: aws_s3
+  #   inputs:
+  #     - events
+  #   bucket: my-bucket
+  #   region: us-east-1
+  #   key_prefix: events/{{team_id}}/{{date}}/
+  #   filename_extension: parquet
+  #   disk_batching:
+  #     max_events: 100000
+  #     max_bytes: 10737418240
+  #     timeout_secs: 60
+  #   encoding:
+  #     codec: parquet
+  #     parquet:
+  #       compression: zstd
+  #       compression_level: 5
+  #       rows_per_file: 10000
+  #       allow_nullable_fields: true
+  #       sorting_columns:
+  #         - column: event
+  #           descending: false
+  #         - column: timestamp
+  #           descending: false
+  #       json_columns:
+  #         - column: properties
+  #           max_subcolumns: 1024
+  #           bucket_count: 256
+  #           max_depth: 10
+  #           keep_original_column: true
+  #       schema:
+  #         uuid:
+  #           type: utf8
+  #         event:
+  #           type: utf8
+  #         properties:
+  #           type: utf8
+  #         timestamp:
+  #           type: timestamp_ms
+  #         team_id:
+  #           type: int64
+  #         distinct_id:
+  #           type: utf8
+  #         created_at:
+  #           type: timestamp_ms
+  #         _timestamp:
+  #           type: timestamp_ms
+  #   request:
+  #     concurrency: 64
+  #     in_flight_limit: 64
+  #     retry_initial_backoff_secs: 1
+  #     retry_max_duration_secs: 600
