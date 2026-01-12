@@ -40,7 +40,7 @@ func TestWriteEvents(t *testing.T) {
 		},
 	}
 
-	writer := NewWriter(cfg)
+	writer := NewWriter(cfg, "")
 
 	events := []map[string]interface{}{
 		{
@@ -96,7 +96,7 @@ func TestWriteEventsWithSorting(t *testing.T) {
 		},
 	}
 
-	writer := NewWriter(cfg)
+	writer := NewWriter(cfg, "")
 
 	events := []map[string]interface{}{
 		{"event": "b", "value": float64(1)},
@@ -126,7 +126,7 @@ func TestWriteEventsEmpty(t *testing.T) {
 		},
 	}
 
-	writer := NewWriter(cfg)
+	writer := NewWriter(cfg, "")
 
 	var buf bytes.Buffer
 	err := writer.WriteEvents(&buf, nil)
@@ -163,7 +163,7 @@ func TestWriteEventsRoundTrip(t *testing.T) {
 		},
 	}
 
-	writer := NewWriter(cfg)
+	writer := NewWriter(cfg, "")
 
 	events := []map[string]interface{}{
 		{

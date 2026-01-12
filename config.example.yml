@@ -44,6 +44,9 @@ sinks:
         compression: zstd
         compression_level: 5
         rows_per_file: 10000
+        max_rows_per_row_group: 1000
+        page_buffer_bytes: 65536
+        use_file_buffer_pool: true
         allow_nullable_fields: true
         sorting_columns:
           - column: event

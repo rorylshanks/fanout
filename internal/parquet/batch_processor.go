@@ -23,10 +23,10 @@ type BatchProcessor struct {
 }
 
 // NewBatchProcessor creates a new batch processor
-func NewBatchProcessor(cfg config.ParquetConfig) *BatchProcessor {
+func NewBatchProcessor(cfg config.ParquetConfig, bufferDir string) *BatchProcessor {
 	return &BatchProcessor{
 		config:      cfg,
-		writer:      NewWriter(cfg),
+		writer:      NewWriter(cfg, bufferDir),
 		rowsPerFile: cfg.RowsPerFile,
 		sortingCols: cfg.SortingColumns,
 	}
@@ -248,9 +248,9 @@ type SortedSplitBatchWriter struct {
 }
 
 // NewSortedSplitBatchWriter creates a new sorted-split-batch writer
-func NewSortedSplitBatchWriter(cfg config.ParquetConfig, maxEvents int, outputDir string) *SortedSplitBatchWriter {
+func NewSortedSplitBatchWriter(cfg config.ParquetConfig, maxEvents int, outputDir string, bufferDir string) *SortedSplitBatchWriter {
 	return &SortedSplitBatchWriter{
-		processor: NewBatchProcessor(cfg),
+		processor: NewBatchProcessor(cfg, bufferDir),
 		maxEvents: maxEvents,
 		outputDir: outputDir,
 	}

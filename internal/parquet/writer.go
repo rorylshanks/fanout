@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/parquet-go/parquet-go/compress/gzip"
 	"github.com/parquet-go/parquet-go/compress/snappy"
 	"github.com/parquet-go/parquet-go/compress/zstd"
+	"github.com/valyala/fastjson"
 	"fanout/internal/config"
 	"fanout/internal/jsonexpand"
 	"fanout/internal/logging"
@@ -23,10 +25,11 @@ type Writer struct {
 	config         config.ParquetConfig
 	jsonProcessors []*jsonexpand.JsonColumnProcessor
 	schemaFields   []config.SchemaFieldWithName
+	bufferDir      string
 }
 
 // NewWriter creates a new Parquet writer
-func NewWriter(cfg config.ParquetConfig) *Writer {
+func NewWriter(cfg config.ParquetConfig, bufferDir string) *Writer {
 	// Create JSON processors
 	var processors []*jsonexpand.JsonColumnProcessor
 	for _, jc := range cfg.JsonColumns {
@@ -46,6 +49,7 @@ func NewWriter(cfg config.ParquetConfig) *Writer {
 		config:         cfg,
 		jsonProcessors: processors,
 		schemaFields:   schemaFields,
+		bufferDir:      bufferDir,
 	}
 }
 
@@ -70,13 +74,15 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 
 	totalStart := time.Now()
 
-	// Process JSON columns to expand them (only if configured)
+	// Process JSON columns to determine subcolumns (only if configured)
 	jsonStart := time.Now()
-	var processedJsonCols map[string]*jsonexpand.ProcessedJsonColumns
+	var jsonPlans map[string]*jsonexpand.JsonColumnPlan
+	jsonProcessors := make(map[string]*jsonexpand.JsonColumnProcessor, len(w.jsonProcessors))
 	if len(w.jsonProcessors) > 0 {
-		processedJsonCols = make(map[string]*jsonexpand.ProcessedJsonColumns)
+		jsonPlans = make(map[string]*jsonexpand.JsonColumnPlan)
 		for _, proc := range w.jsonProcessors {
 			colName := proc.ColumnName()
+			jsonProcessors[colName] = proc
 			values := make([]string, len(events))
 			for i, event := range events {
 				if v, ok := event[colName]; ok {
@@ -85,7 +91,7 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 					}
 				}
 			}
-			processedJsonCols[colName] = proc.ProcessBatch(values)
+			jsonPlans[colName] = proc.BuildPlan(values)
 		}
 	}
 
@@ -101,24 +107,24 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 	}
 
 	// Add JSON subcolumn info with pre-computed lookup info
-	for _, processed := range processedJsonCols {
-		for subcolName := range processed.Subcolumns {
+	for _, plan := range jsonPlans {
+		for subcolName := range plan.SubcolumnTypes {
 			columns = append(columns, columnInfo{
 				name:         subcolName,
 				fieldType:    "utf8",
 				isJsonSubcol: true,
-				jsonColName:  processed.ColumnName,
+				jsonColName:  plan.ColumnName,
 				subcolName:   subcolName,
 				bucketIdx:    -1,
 			})
 		}
-		for bucketIdx := 0; bucketIdx < processed.BucketCount; bucketIdx++ {
-			bucketColName := processed.ColumnName + fmt.Sprintf("__json_type_bucket_%d", bucketIdx)
+		for bucketIdx := 0; bucketIdx < plan.BucketCount; bucketIdx++ {
+			bucketColName := plan.ColumnName + fmt.Sprintf("__json_type_bucket_%d", bucketIdx)
 			columns = append(columns, columnInfo{
 				name:         bucketColName,
 				fieldType:    "json",
 				isJsonSubcol: true,
-				jsonColName:  processed.ColumnName,
+				jsonColName:  plan.ColumnName,
 				bucketIdx:    bucketIdx,
 			})
 		}
@@ -132,7 +138,7 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 
 	// Build schema and write directly - skip intermediate row map
 	parquetStart := time.Now()
-	err := w.writeParquetDirect(out, events, columns, processedJsonCols)
+	err := w.writeParquetDirect(out, events, columns, jsonPlans, jsonProcessors)
 	parquetDuration := time.Since(parquetStart)
 
 	totalDuration := time.Since(totalStart)
@@ -148,8 +154,105 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 	return err
 }
 
+// ParseEvent decodes a JSON event and extracts only configured schema fields.
+func (w *Writer) ParseEvent(raw []byte) (map[string]interface{}, error) {
+	var p fastjson.Parser
+	v, err := p.ParseBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	event := make(map[string]interface{}, len(w.schemaFields))
+	for _, sf := range w.schemaFields {
+		val := v.Get(sf.Name)
+		if val == nil {
+			continue
+		}
+		converted := w.valueFromFastjson(val, sf.Field.Type)
+		if converted != nil {
+			event[sf.Name] = converted
+		}
+	}
+
+	return event, nil
+}
+
+func (w *Writer) valueFromFastjson(val *fastjson.Value, fieldType string) interface{} {
+	switch fieldType {
+	case "utf8", "string", "json":
+		switch val.Type() {
+		case fastjson.TypeString:
+			return string(val.GetStringBytes())
+		case fastjson.TypeNull:
+			return nil
+		default:
+			return string(val.MarshalTo(nil))
+		}
+	case "int64":
+		if val.Type() == fastjson.TypeNumber {
+			if v, err := val.Int64(); err == nil {
+				return v
+			}
+			if v, err := val.Float64(); err == nil {
+				return int64(v)
+			}
+		}
+		return nil
+	case "int32":
+		if val.Type() == fastjson.TypeNumber {
+			if v, err := val.Int64(); err == nil {
+				return int32(v)
+			}
+			if v, err := val.Float64(); err == nil {
+				return int32(v)
+			}
+		}
+		return nil
+	case "float64", "double":
+		if val.Type() == fastjson.TypeNumber {
+			if v, err := val.Float64(); err == nil {
+				return v
+			}
+		}
+		return nil
+	case "float32", "float":
+		if val.Type() == fastjson.TypeNumber {
+			if v, err := val.Float64(); err == nil {
+				return float32(v)
+			}
+		}
+		return nil
+	case "bool", "boolean":
+		if val.Type() == fastjson.TypeTrue {
+			return true
+		}
+		if val.Type() == fastjson.TypeFalse {
+			return false
+		}
+		return nil
+	case "timestamp_ms":
+		switch val.Type() {
+		case fastjson.TypeNumber:
+			if v, err := val.Int64(); err == nil {
+				return v
+			}
+			if v, err := val.Float64(); err == nil {
+				return int64(v)
+			}
+		case fastjson.TypeString:
+			if t := w.parseTimestampString(string(val.GetStringBytes())); t != nil {
+				return t.UnixMilli()
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+
 // writeParquetDirect writes events directly to parquet without intermediate row map
-func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface{}, columns []columnInfo, processedJsonCols map[string]*jsonexpand.ProcessedJsonColumns) error {
+func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface{}, columns []columnInfo, jsonPlans map[string]*jsonexpand.JsonColumnPlan, jsonProcessors map[string]*jsonexpand.JsonColumnProcessor) error {
 	totalStart := time.Now()
 
 	// Build parquet schema
@@ -189,7 +292,7 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 	// Create writer with compression - write directly to output (parquet-go has its own buffering)
 	writerStart := time.Now()
 	compressionCodec := w.getCompressionCodec()
-	pw := goparquet.NewWriter(out,
+	writerOptions := []goparquet.WriterOption{
 		schema,
 		goparquet.Compression(compressionCodec),
 		// Disable data page statistics - saves significant metadata space (247KB for 993 columns)
@@ -199,7 +302,27 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 		// This is especially effective for columns with repeated values (e.g., feature flags)
 		// Benchmark: 4.45MB -> 1.14MB (3.9x smaller, even smaller than ClickHouse output)
 		goparquet.DefaultEncoding(&goparquet.RLEDictionary),
-	)
+	}
+	if w.config.MaxRowsPerRowGroup > 0 {
+		writerOptions = append(writerOptions, goparquet.MaxRowsPerRowGroup(int64(w.config.MaxRowsPerRowGroup)))
+	}
+	if w.config.PageBufferBytes > 0 {
+		writerOptions = append(writerOptions, goparquet.PageBufferSize(w.config.PageBufferBytes))
+	}
+	if w.config.UseFileBufferPool != nil && *w.config.UseFileBufferPool && len(events) > 1000 {
+		bufferDir := w.bufferDir
+		if bufferDir == "" {
+			bufferDir = os.TempDir()
+		}
+		if err := os.MkdirAll(bufferDir, 0755); err != nil {
+			return fmt.Errorf("failed to create parquet buffer dir: %w", err)
+		}
+		writerOptions = append(writerOptions,
+			goparquet.ColumnPageBuffers(goparquet.NewFileBufferPool(bufferDir, "fanout-parquet-*.buf")),
+		)
+	}
+
+	pw := goparquet.NewWriter(out, writerOptions...)
 	writerCreateDuration := time.Since(writerStart)
 
 	// Convert events directly to parquet rows (skip intermediate map)
@@ -214,7 +337,20 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 		parquetRows := make([]goparquet.Row, end-start)
 
 		for rowOffset, event := range events[start:end] {
-			rowIndex := start + rowOffset
+			var rowJson map[string]*jsonexpand.RowExpansion
+			if len(jsonPlans) > 0 {
+				rowJson = make(map[string]*jsonexpand.RowExpansion, len(jsonPlans))
+				for colName, plan := range jsonPlans {
+					if proc := jsonProcessors[colName]; proc != nil {
+						if v, ok := event[colName]; ok {
+							if s, ok := v.(string); ok && s != "" {
+								rowJson[colName] = proc.ExpandRow(plan, s)
+							}
+						}
+					}
+				}
+			}
+
 			parquetRow := make([]goparquet.Value, len(schemaColumnOrder))
 			for idx, col := range schemaColumnOrder {
 				var val interface{}
@@ -223,22 +359,18 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 					val = event[col.name]
 				} else if col.bucketIdx >= 0 {
 					// JSON bucket column
-					if processed, ok := processedJsonCols[col.jsonColName]; ok {
-						if col.bucketIdx < len(processed.BucketMaps) {
-							if bucketData := processed.BucketMaps[col.bucketIdx]; bucketData != nil && rowIndex < len(bucketData) && bucketData[rowIndex] != nil {
-								if jsonBytes, err := json.Marshal(bucketData[rowIndex]); err == nil {
-									val = string(jsonBytes)
-								}
+					if expanded := rowJson[col.jsonColName]; expanded != nil {
+						if bucketData := expanded.BucketValues[col.bucketIdx]; bucketData != nil {
+							if jsonBytes, err := json.Marshal(bucketData); err == nil {
+								val = string(jsonBytes)
 							}
 						}
 					}
 				} else {
 					// JSON subcolumn
-					if processed, ok := processedJsonCols[col.jsonColName]; ok {
-						if subcolData, ok := processed.Subcolumns[col.subcolName]; ok {
-							if rowIndex < len(subcolData.Values) && subcolData.Values[rowIndex] != nil {
-								val = fmt.Sprintf("%v", subcolData.Values[rowIndex])
-							}
+					if expanded := rowJson[col.jsonColName]; expanded != nil {
+						if subcolValue, ok := expanded.SubcolumnValues[col.subcolName]; ok && subcolValue != nil {
+							val = fmt.Sprintf("%v", subcolValue)
 						}
 					}
 				}

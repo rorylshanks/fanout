@@ -73,6 +73,21 @@ type ProcessedJsonColumns struct {
 	NumRows        int
 }
 
+// JsonColumnPlan defines subcolumns and buckets without storing per-row values.
+type JsonColumnPlan struct {
+	ColumnName        string
+	SubcolumnTypes    map[string]InferredType // full column name -> inferred type
+	SubcolumnKeyTypes map[string]InferredType // raw key -> inferred type
+	OverflowKeys      map[string]bool         // raw key -> overflow bucket
+	BucketCount       int
+}
+
+// RowExpansion contains JSON subcolumn and bucket values for a single row.
+type RowExpansion struct {
+	SubcolumnValues map[string]interface{} // full column name -> value
+	BucketValues    map[int]map[string]string
+}
+
 // JsonColumnProcessor handles JSON column expansion
 type JsonColumnProcessor struct {
 	config config.JsonColumnConfig
@@ -86,6 +101,122 @@ func NewJsonColumnProcessor(cfg config.JsonColumnConfig) *JsonColumnProcessor {
 // ColumnName returns the column name this processor handles
 func (p *JsonColumnProcessor) ColumnName() string {
 	return p.config.Column
+}
+
+// BuildPlan determines subcolumns/buckets without storing per-row values.
+func (p *JsonColumnProcessor) BuildPlan(jsonValues []string) *JsonColumnPlan {
+	// Pass 1: Scan keys to determine schema
+	keyStats := make(map[string]*KeyStats)
+
+	for _, jsonStr := range jsonValues {
+		if jsonStr == "" {
+			continue
+		}
+
+		// Use json.Number to preserve large integers
+		decoder := json.NewDecoder(strings.NewReader(jsonStr))
+		decoder.UseNumber()
+		var obj map[string]interface{}
+		if err := decoder.Decode(&obj); err != nil {
+			continue
+		}
+
+		flattened := make(map[string]interface{})
+		p.flattenObject(obj, "", 0, flattened)
+
+		for key, value := range flattened {
+			inferredType := p.inferType(value)
+			if stats, ok := keyStats[key]; ok {
+				stats.Count++
+				stats.InferredType = resolveTypeConflict(stats.InferredType, inferredType)
+			} else {
+				keyStats[key] = &KeyStats{
+					Count:        1,
+					InferredType: inferredType,
+				}
+			}
+		}
+	}
+
+	// Sort keys by frequency to determine subcolumns vs overflow
+	type keyFreq struct {
+		key   string
+		stats *KeyStats
+	}
+	sortedKeys := make([]keyFreq, 0, len(keyStats))
+	for key, stats := range keyStats {
+		sortedKeys = append(sortedKeys, keyFreq{key, stats})
+	}
+	sort.Slice(sortedKeys, func(i, j int) bool {
+		if sortedKeys[i].stats.Count != sortedKeys[j].stats.Count {
+			return sortedKeys[i].stats.Count > sortedKeys[j].stats.Count
+		}
+		return sortedKeys[i].key < sortedKeys[j].key
+	})
+
+	subcolumnKeyTypes := make(map[string]InferredType)
+	overflowKeys := make(map[string]bool)
+	subcolumnTypes := make(map[string]InferredType)
+
+	for i, kf := range sortedKeys {
+		if i < p.config.MaxSubcolumns {
+			subcolumnKeyTypes[kf.key] = kf.stats.InferredType
+			fullKey := p.config.Column + "." + kf.key
+			subcolumnTypes[fullKey] = kf.stats.InferredType
+		} else {
+			overflowKeys[kf.key] = true
+		}
+	}
+
+	return &JsonColumnPlan{
+		ColumnName:        p.config.Column,
+		SubcolumnTypes:    subcolumnTypes,
+		SubcolumnKeyTypes: subcolumnKeyTypes,
+		OverflowKeys:      overflowKeys,
+		BucketCount:       p.config.BucketCount,
+	}
+}
+
+// ExpandRow expands a JSON string into subcolumn and bucket values for one row.
+func (p *JsonColumnProcessor) ExpandRow(plan *JsonColumnPlan, jsonStr string) *RowExpansion {
+	if jsonStr == "" || plan == nil {
+		return nil
+	}
+
+	decoder := json.NewDecoder(strings.NewReader(jsonStr))
+	decoder.UseNumber()
+	var obj map[string]interface{}
+	if err := decoder.Decode(&obj); err != nil {
+		return nil
+	}
+
+	flattened := make(map[string]interface{})
+	p.flattenObject(obj, "", 0, flattened)
+
+	subcolumnValues := make(map[string]interface{})
+	bucketValues := make(map[int]map[string]string)
+
+	for key, value := range flattened {
+		if inferredType, ok := plan.SubcolumnKeyTypes[key]; ok {
+			fullKey := plan.ColumnName + "." + key
+			if converted := p.convertValue(value, inferredType); converted != nil {
+				subcolumnValues[fullKey] = converted
+			}
+			continue
+		}
+		if plan.OverflowKeys[key] {
+			bucketIdx := p.hashKeyToBucket(key)
+			if bucketValues[bucketIdx] == nil {
+				bucketValues[bucketIdx] = make(map[string]string)
+			}
+			bucketValues[bucketIdx][key] = p.valueToString(value)
+		}
+	}
+
+	return &RowExpansion{
+		SubcolumnValues: subcolumnValues,
+		BucketValues:    bucketValues,
+	}
 }
 
 // ProcessBatch processes a batch of JSON string values

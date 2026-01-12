@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -34,14 +35,14 @@ type ParquetFileInfo struct {
 }
 
 // NewStreamingProcessor creates a streaming processor
-func NewStreamingProcessor(cfg config.ParquetConfig, tempDir string) *StreamingProcessor {
+func NewStreamingProcessor(cfg config.ParquetConfig, tempDir string, bufferDir string) *StreamingProcessor {
 	rowsPerFile := cfg.RowsPerFile
 	if rowsPerFile <= 0 {
 		rowsPerFile = 10000
 	}
 	return &StreamingProcessor{
 		config:      cfg,
-		writer:      NewWriter(cfg),
+		writer:      NewWriter(cfg, bufferDir),
 		rowsPerFile: rowsPerFile,
 		sortingCols: cfg.SortingColumns,
 		tempDir:     tempDir,
@@ -94,9 +95,8 @@ func (p *StreamingProcessor) processWithoutSort(bufferPath string, outputDir str
 			return files, fmt.Errorf("failed to read data: %w", err)
 		}
 
-		// Parse JSON
-		var event map[string]interface{}
-		if err := json.Unmarshal(data, &event); err != nil {
+		event, err := p.writer.ParseEvent(data)
+		if err != nil {
 			continue // Skip invalid JSON
 		}
 
@@ -152,7 +152,7 @@ func (p *StreamingProcessor) processWithSort(bufferPath string, outputDir string
 
 	// Phase 2: Merge sorted chunks and write final parquet files
 	phase2Start := time.Now()
-	result, err := p.mergeSortedChunks(tempFiles, outputDir, totalEvents)
+	result, err := p.mergeSortedChunks(bufferPath, tempFiles, outputDir, totalEvents)
 	phase2Duration := time.Since(phase2Start)
 
 	if totalEvents > 10000 {
@@ -171,14 +171,16 @@ type sortedChunk struct {
 	path     string
 	file     *os.File
 	reader   *bufio.Reader
-	nextRaw  []byte
 	nextKeys []interface{}
+	nextOff  int64
+	nextLen  uint32
 	done     bool
 }
 
 type sortEvent struct {
-	raw  []byte
-	keys []interface{}
+	offset int64
+	length uint32
+	keys   []interface{}
 }
 
 // createSortedChunks reads the buffer, sorts chunks, writes temp files
@@ -193,6 +195,7 @@ func (p *StreamingProcessor) createSortedChunks(bufferPath string, chunkSize int
 	var chunks []*sortedChunk
 	var batch []sortEvent
 	totalEvents := 0
+	var offset int64
 
 	for {
 		// Read length prefix
@@ -212,14 +215,17 @@ func (p *StreamingProcessor) createSortedChunks(bufferPath string, chunkSize int
 		}
 
 		if !gjson.ValidBytes(data) {
+			offset += int64(4 + length)
 			continue
 		}
 
 		batch = append(batch, sortEvent{
-			raw:  data,
-			keys: p.extractSortKeys(data),
+			offset: offset + 4,
+			length: length,
+			keys:   p.extractSortKeys(data),
 		})
 		totalEvents++
+		offset += int64(4 + length)
 
 		// Sort and write chunk when full
 		if len(batch) >= chunkSize {
@@ -260,14 +266,7 @@ func (p *StreamingProcessor) writeSortedChunk(events []sortEvent, chunkNum int, 
 
 	writer := bufio.NewWriterSize(file, 128*1024)
 	for _, event := range events {
-		// Write length-prefixed
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(event.raw)))
-		if _, err := writer.Write(lenBuf[:]); err != nil {
-			file.Close()
-			return nil, err
-		}
-		if _, err := writer.Write(event.raw); err != nil {
+		if err := writeSortRecord(writer, event.keys, event.offset, event.length); err != nil {
 			file.Close()
 			return nil, err
 		}
@@ -283,9 +282,14 @@ func (p *StreamingProcessor) writeSortedChunk(events []sortEvent, chunkNum int, 
 }
 
 // mergeSortedChunks performs k-way merge and writes parquet files
-func (p *StreamingProcessor) mergeSortedChunks(chunks []*sortedChunk, outputDir string, totalEvents int) ([]ParquetFileInfo, error) {
+func (p *StreamingProcessor) mergeSortedChunks(bufferPath string, chunks []*sortedChunk, outputDir string, totalEvents int) ([]ParquetFileInfo, error) {
 	mergeStart := time.Now()
 	var totalReadTime, totalWriteTime time.Duration
+	bufferFile, err := os.Open(bufferPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open buffer for merge: %w", err)
+	}
+	defer bufferFile.Close()
 
 	// Open all chunk files for reading
 	for _, chunk := range chunks {
@@ -316,13 +320,20 @@ func (p *StreamingProcessor) mergeSortedChunks(chunks []*sortedChunk, outputDir 
 
 	// Merge and write parquet files
 	var files []ParquetFileInfo
-	var batchRaw [][]byte
+	events := make([]map[string]interface{}, 0, p.rowsPerFile)
 
 	for h.Len() > 0 {
 		// Get minimum event
 		readStart := time.Now()
 		minChunk := heap.Pop(h).(*sortedChunk)
-		batchRaw = append(batchRaw, minChunk.nextRaw)
+		data := make([]byte, minChunk.nextLen)
+		if _, err := bufferFile.ReadAt(data, minChunk.nextOff); err != nil {
+			return files, fmt.Errorf("failed to read buffer at offset: %w", err)
+		}
+		event, err := p.writer.ParseEvent(data)
+		if err == nil {
+			events = append(events, event)
+		}
 
 		// Read next event from this chunk
 		if err := p.readNextEvent(minChunk); err != nil && err != io.EOF {
@@ -334,35 +345,27 @@ func (p *StreamingProcessor) mergeSortedChunks(chunks []*sortedChunk, outputDir 
 		totalReadTime += time.Since(readStart)
 
 		// Write batch when full
-		if len(batchRaw) >= p.rowsPerFile {
+		if len(events) >= p.rowsPerFile {
 			writeStart := time.Now()
 			path := filepath.Join(outputDir, buildFilename())
-			events, err := p.parseBatchEvents(batchRaw)
-			if err != nil {
-				return files, err
-			}
 			if err := p.writeBatchToParquet(events, path); err != nil {
 				return files, err
 			}
 			totalWriteTime += time.Since(writeStart)
-			files = append(files, ParquetFileInfo{Path: path, RowCount: len(batchRaw)})
-			batchRaw = batchRaw[:0]
+			files = append(files, ParquetFileInfo{Path: path, RowCount: len(events)})
+			events = events[:0]
 		}
 	}
 
 	// Write remaining batch
-	if len(batchRaw) > 0 {
+	if len(events) > 0 {
 		writeStart := time.Now()
 		path := filepath.Join(outputDir, buildFilename())
-		events, err := p.parseBatchEvents(batchRaw)
-		if err != nil {
-			return files, err
-		}
 		if err := p.writeBatchToParquet(events, path); err != nil {
 			return files, err
 		}
 		totalWriteTime += time.Since(writeStart)
-		files = append(files, ParquetFileInfo{Path: path, RowCount: len(batchRaw)})
+		files = append(files, ParquetFileInfo{Path: path, RowCount: len(events)})
 	}
 
 	if totalEvents > 10000 {
@@ -380,8 +383,7 @@ func (p *StreamingProcessor) mergeSortedChunks(chunks []*sortedChunk, outputDir 
 
 // readNextEvent reads the next event from a chunk
 func (p *StreamingProcessor) readNextEvent(chunk *sortedChunk) error {
-	var lenBuf [4]byte
-	_, err := io.ReadFull(chunk.reader, lenBuf[:])
+	keys, offset, length, err := readSortRecord(chunk.reader, len(p.sortingCols))
 	if err == io.EOF {
 		chunk.done = true
 		return io.EOF
@@ -389,20 +391,113 @@ func (p *StreamingProcessor) readNextEvent(chunk *sortedChunk) error {
 	if err != nil {
 		return err
 	}
+	chunk.nextKeys = keys
+	chunk.nextOff = offset
+	chunk.nextLen = length
+	return nil
+}
 
-	length := binary.BigEndian.Uint32(lenBuf[:])
-	data := make([]byte, length)
-	if _, err := io.ReadFull(chunk.reader, data); err != nil {
+func writeSortRecord(w io.Writer, keys []interface{}, offset int64, length uint32) error {
+	for _, key := range keys {
+		switch v := key.(type) {
+		case nil:
+			if _, err := w.Write([]byte{0}); err != nil {
+				return err
+			}
+		case string:
+			if _, err := w.Write([]byte{1}); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.BigEndian, uint32(len(v))); err != nil {
+				return err
+			}
+			if _, err := w.Write([]byte(v)); err != nil {
+				return err
+			}
+		case float64:
+			if _, err := w.Write([]byte{2}); err != nil {
+				return err
+			}
+			if err := binary.Write(w, binary.BigEndian, math.Float64bits(v)); err != nil {
+				return err
+			}
+		case bool:
+			if _, err := w.Write([]byte{3}); err != nil {
+				return err
+			}
+			if v {
+				if _, err := w.Write([]byte{1}); err != nil {
+					return err
+				}
+			} else {
+				if _, err := w.Write([]byte{0}); err != nil {
+					return err
+				}
+			}
+		default:
+			return fmt.Errorf("unsupported sort key type: %T", key)
+		}
+	}
+
+	if err := binary.Write(w, binary.BigEndian, offset); err != nil {
 		return err
 	}
+	if err := binary.Write(w, binary.BigEndian, length); err != nil {
+		return err
+	}
+	return nil
+}
 
-	if !gjson.ValidBytes(data) {
-		return p.readNextEvent(chunk)
+func readSortRecord(r io.Reader, keyCount int) ([]interface{}, int64, uint32, error) {
+	keys := make([]interface{}, keyCount)
+	for i := 0; i < keyCount; i++ {
+		var typeBuf [1]byte
+		if _, err := io.ReadFull(r, typeBuf[:]); err != nil {
+			return nil, 0, 0, err
+		}
+		switch typeBuf[0] {
+		case 0:
+			keys[i] = nil
+		case 1:
+			var l uint32
+			if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+				return nil, 0, 0, err
+			}
+			if l == 0 {
+				keys[i] = ""
+				continue
+			}
+			buf := make([]byte, l)
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return nil, 0, 0, err
+			}
+			keys[i] = string(buf)
+		case 2:
+			var bits uint64
+			if err := binary.Read(r, binary.BigEndian, &bits); err != nil {
+				return nil, 0, 0, err
+			}
+			keys[i] = math.Float64frombits(bits)
+		case 3:
+			var b [1]byte
+			if _, err := io.ReadFull(r, b[:]); err != nil {
+				return nil, 0, 0, err
+			}
+			keys[i] = b[0] == 1
+		default:
+			return nil, 0, 0, fmt.Errorf("unknown sort key type: %d", typeBuf[0])
+		}
 	}
 
-	chunk.nextRaw = data
-	chunk.nextKeys = p.extractSortKeys(data)
-	return nil
+	var offset int64
+	if err := binary.Read(r, binary.BigEndian, &offset); err != nil {
+		return nil, 0, 0, err
+	}
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return nil, 0, 0, err
+	}
+	return keys, offset, length, nil
 }
 
 // eventHeap implements heap.Interface for k-way merge

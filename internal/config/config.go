@@ -97,6 +97,9 @@ type ParquetConfig struct {
 	Compression             string                    `yaml:"compression"`
 	CompressionLevel        int                       `yaml:"compression_level"`
 	RowsPerFile             int                       `yaml:"rows_per_file"`
+	MaxRowsPerRowGroup      int                       `yaml:"max_rows_per_row_group"`
+	PageBufferBytes         int                       `yaml:"page_buffer_bytes"`
+	UseFileBufferPool       *bool                     `yaml:"use_file_buffer_pool"`
 	AllowNullableFields     bool                      `yaml:"allow_nullable_fields"`
 	UseMemoryMappedFiles    bool                      `yaml:"use_memory_mapped_files"`
 	SortingColumns          []SortingColumn           `yaml:"sorting_columns"`
@@ -182,6 +185,16 @@ func Load(path string) (*Config, error) {
 		}
 		if sink.Encoding.Parquet.RowsPerFile == 0 {
 			sink.Encoding.Parquet.RowsPerFile = 10000
+		}
+		if sink.Encoding.Parquet.MaxRowsPerRowGroup == 0 {
+			sink.Encoding.Parquet.MaxRowsPerRowGroup = 1000
+		}
+		if sink.Encoding.Parquet.PageBufferBytes == 0 {
+			sink.Encoding.Parquet.PageBufferBytes = 64 * 1024
+		}
+		if sink.Encoding.Parquet.UseFileBufferPool == nil {
+			enabled := true
+			sink.Encoding.Parquet.UseFileBufferPool = &enabled
 		}
 		if sink.Encoding.Parquet.CompressionLevel == 0 {
 			sink.Encoding.Parquet.CompressionLevel = 5
