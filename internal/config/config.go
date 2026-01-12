@@ -12,6 +12,7 @@ import (
 // Config represents the entire configuration file
 type Config struct {
 	DataDir string            `yaml:"data_dir"`
+	MetricsPort int           `yaml:"metrics_port"`
 	Sources map[string]Source `yaml:"sources"`
 	Sinks   map[string]Sink   `yaml:"sinks"`
 }
@@ -158,6 +159,9 @@ func Load(path string) (*Config, error) {
 	// Set defaults
 	if cfg.DataDir == "" {
 		cfg.DataDir = "/data/"
+	}
+	if cfg.MetricsPort == 0 {
+		cfg.MetricsPort = 8075
 	}
 
 	for name, sink := range cfg.Sinks {

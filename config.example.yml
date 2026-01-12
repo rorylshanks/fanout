@@ -2,6 +2,7 @@
 # Copy this to config.yml and modify as needed
 
 data_dir: /mnt/fanout/
+metrics_port: 8075
 
 sources:
   events:
