@@ -42,6 +42,7 @@ type Metrics struct {
 	BytesWritten     prometheus.Counter
 	FilesUploaded    prometheus.Counter
 	RowsWritten      prometheus.Counter
+	FileSizeBytes    prometheus.Histogram
 
 	// Flush latency histograms
 	ParquetWriteLatency prometheus.Histogram
@@ -190,6 +191,17 @@ func New(namespace string) *Metrics {
 			Namespace: namespace,
 			Name:      "rows_written_total",
 			Help:      "Total rows written to parquet files",
+		}),
+		FileSizeBytes: promauto.NewHistogram(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "file_size_bytes",
+			Help:      "Parquet file size in bytes",
+			Buckets: []float64{
+				100 * 1024,
+				1 * 1024 * 1024,
+				10 * 1024 * 1024,
+				30 * 1024 * 1024,
+			},
 		}),
 
 		// Flush latency histograms (milliseconds)
