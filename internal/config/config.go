@@ -100,6 +100,7 @@ type ParquetConfig struct {
 	RowsPerFile             int                       `yaml:"rows_per_file"`
 	MaxRowsPerRowGroup      int                       `yaml:"max_rows_per_row_group"`
 	PageBufferBytes         int                       `yaml:"page_buffer_bytes"`
+	PageBoundsMaxValueBytes int                       `yaml:"page_bounds_max_value_bytes"`
 	UseFileBufferPool       *bool                     `yaml:"use_file_buffer_pool"`
 	AllowNullableFields     bool                      `yaml:"allow_nullable_fields"`
 	UseMemoryMappedFiles    bool                      `yaml:"use_memory_mapped_files"`

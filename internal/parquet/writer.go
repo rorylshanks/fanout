@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	goparquet "github.com/parquet-go/parquet-go"
@@ -26,7 +27,11 @@ type Writer struct {
 	jsonProcessors []*jsonexpand.JsonColumnProcessor
 	schemaFields   []config.SchemaFieldWithName
 	bufferDir      string
+	stageRecorder  ParquetStageRecorder
 }
+
+// ParquetStageRecorder records wall/CPU time by parquet encode stage.
+type ParquetStageRecorder func(stage string, wallNs int64, cpuNs int64)
 
 // NewWriter creates a new Parquet writer
 func NewWriter(cfg config.ParquetConfig, bufferDir string) *Writer {
@@ -53,6 +58,11 @@ func NewWriter(cfg config.ParquetConfig, bufferDir string) *Writer {
 	}
 }
 
+// SetStageRecorder sets the optional parquet stage recorder.
+func (w *Writer) SetStageRecorder(recorder ParquetStageRecorder) {
+	w.stageRecorder = recorder
+}
+
 // DynamicRow is used for writing dynamic data to parquet
 type DynamicRow map[string]interface{}
 
@@ -73,9 +83,11 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 	}
 
 	totalStart := time.Now()
+	w.recordStage(ParquetStageFile, 0, 0)
 
 	// Process JSON columns to determine subcolumns (only if configured)
 	jsonStart := time.Now()
+	jsonCPUStart := cpuTimeNs()
 	var jsonPlans map[string]*jsonexpand.JsonColumnPlan
 	jsonProcessors := make(map[string]*jsonexpand.JsonColumnProcessor, len(w.jsonProcessors))
 	if len(w.jsonProcessors) > 0 {
@@ -135,6 +147,8 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 		return columns[i].name < columns[j].name
 	})
 	jsonDuration := time.Since(jsonStart)
+	jsonCPUDuration := cpuTimeNs() - jsonCPUStart
+	w.recordStage(ParquetStageJSON, jsonDuration.Nanoseconds(), jsonCPUDuration)
 
 	// Build schema and write directly - skip intermediate row map
 	parquetStart := time.Now()
@@ -257,6 +271,7 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 
 	// Build parquet schema
 	schemaStart := time.Now()
+	schemaCPUStart := cpuTimeNs()
 	group := make(goparquet.Group)
 	for _, col := range columns {
 		group[col.name] = w.createNode(col.name, col.fieldType)
@@ -288,9 +303,12 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 			len(schemaColumnOrder), len(columns), len(schemaCols))
 	}
 	schemaDuration := time.Since(schemaStart)
+	schemaCPUDuration := cpuTimeNs() - schemaCPUStart
+	w.recordStage(ParquetStageSchema, schemaDuration.Nanoseconds(), schemaCPUDuration)
 
 	// Create writer with compression - write directly to output (parquet-go has its own buffering)
 	writerStart := time.Now()
+	writerCPUStart := cpuTimeNs()
 	compressionCodec := w.getCompressionCodec()
 	writerOptions := []goparquet.WriterOption{
 		schema,
@@ -302,6 +320,12 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 		// This is especially effective for columns with repeated values (e.g., feature flags)
 		// Benchmark: 4.45MB -> 1.14MB (3.9x smaller, even smaller than ClickHouse output)
 		goparquet.DefaultEncoding(&goparquet.RLEDictionary),
+	}
+	if w.config.PageBoundsMaxValueBytes > 0 {
+		skipBounds := w.columnsExceedingPageBounds(events, columns, jsonPlans, jsonProcessors, w.config.PageBoundsMaxValueBytes)
+		for name := range skipBounds {
+			writerOptions = append(writerOptions, goparquet.SkipPageBounds(name))
+		}
 	}
 	if w.config.MaxRowsPerRowGroup > 0 {
 		writerOptions = append(writerOptions, goparquet.MaxRowsPerRowGroup(int64(w.config.MaxRowsPerRowGroup)))
@@ -324,16 +348,23 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 
 	pw := goparquet.NewWriter(out, writerOptions...)
 	writerCreateDuration := time.Since(writerStart)
+	writerCPUCreateDuration := cpuTimeNs() - writerCPUStart
+	w.recordStage(ParquetStageWriterInit, writerCreateDuration.Nanoseconds(), writerCPUCreateDuration)
 
 	// Convert events directly to parquet rows (skip intermediate map)
-	convertStart := time.Now()
-	writeStart := time.Now()
+	var convertDuration time.Duration
+	var writeDuration time.Duration
+	var convertCPUNs int64
+	var writeCPUNs int64
 	const rowChunkSize = 2048
 	for start := 0; start < len(events); start += rowChunkSize {
 		end := start + rowChunkSize
 		if end > len(events) {
 			end = len(events)
 		}
+
+		convertStart := time.Now()
+		convertCPUStart := cpuTimeNs()
 		parquetRows := make([]goparquet.Row, end-start)
 
 		for rowOffset, event := range events[start:end] {
@@ -378,20 +409,29 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 			}
 			parquetRows[rowOffset] = parquetRow
 		}
+		convertDuration += time.Since(convertStart)
+		convertCPUNs += cpuTimeNs() - convertCPUStart
 
+		writeStart := time.Now()
+		writeCPUStart := cpuTimeNs()
 		if _, err := pw.WriteRows(parquetRows); err != nil {
 			pw.Close()
 			return fmt.Errorf("failed to write rows: %w", err)
 		}
+		writeDuration += time.Since(writeStart)
+		writeCPUNs += cpuTimeNs() - writeCPUStart
 	}
-	writeDuration := time.Since(writeStart)
-	convertDuration := time.Since(convertStart)
+	w.recordStage(ParquetStageRowConvert, convertDuration.Nanoseconds(), convertCPUNs)
+	w.recordStage(ParquetStageRowWrite, writeDuration.Nanoseconds(), writeCPUNs)
 
 	closeStart := time.Now()
+	closeCPUStart := cpuTimeNs()
 	if err := pw.Close(); err != nil {
 		return fmt.Errorf("failed to close parquet writer: %w", err)
 	}
 	closeDuration := time.Since(closeStart)
+	closeCPUDuration := cpuTimeNs() - closeCPUStart
+	w.recordStage(ParquetStageWriterClose, closeDuration.Nanoseconds(), closeCPUDuration)
 
 	totalDuration := time.Since(totalStart)
 	if len(events) >= 10000 && totalDuration > 100*time.Millisecond {
@@ -407,6 +447,25 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 	}
 
 	return nil
+}
+
+func (w *Writer) recordStage(stage string, wallNs int64, cpuNs int64) {
+	if w.stageRecorder == nil {
+		return
+	}
+	w.stageRecorder(stage, wallNs, cpuNs)
+}
+
+func cpuTimeNs() int64 {
+	var usage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil {
+		return 0
+	}
+	return timevalToNs(usage.Utime) + timevalToNs(usage.Stime)
+}
+
+func timevalToNs(tv syscall.Timeval) int64 {
+	return int64(tv.Sec)*1e9 + int64(tv.Usec)*1e3
 }
 
 // toParquetValueFast converts a Go value to a parquet value with minimal overhead
@@ -557,6 +616,103 @@ func (w *Writer) toParquetValueFast(val interface{}, fieldType string, columnInd
 			return goparquet.ValueOf(s)
 		}
 		return goparquet.ValueOf("")
+	}
+}
+
+func (w *Writer) columnsExceedingPageBounds(events []map[string]interface{}, columns []columnInfo, jsonPlans map[string]*jsonexpand.JsonColumnPlan, jsonProcessors map[string]*jsonexpand.JsonColumnProcessor, maxBytes int) map[string]struct{} {
+	if maxBytes <= 0 {
+		return nil
+	}
+
+	checkCols := make([]columnInfo, 0, len(columns))
+	needsJSON := false
+	for _, col := range columns {
+		if !isBoundsSizedType(col.fieldType) {
+			continue
+		}
+		checkCols = append(checkCols, col)
+		if col.isJsonSubcol {
+			needsJSON = true
+		}
+	}
+	if len(checkCols) == 0 {
+		return nil
+	}
+
+	exceeded := make(map[string]struct{})
+	for _, event := range events {
+		var rowJson map[string]*jsonexpand.RowExpansion
+		if needsJSON && len(jsonPlans) > 0 {
+			rowJson = make(map[string]*jsonexpand.RowExpansion, len(jsonPlans))
+			for colName, plan := range jsonPlans {
+				if proc := jsonProcessors[colName]; proc != nil {
+					if v, ok := event[colName]; ok {
+						if s, ok := v.(string); ok && s != "" {
+							rowJson[colName] = proc.ExpandRow(plan, s)
+						}
+					}
+				}
+			}
+		}
+
+		for _, col := range checkCols {
+			if _, ok := exceeded[col.name]; ok {
+				continue
+			}
+			val := valueForColumn(event, col, rowJson)
+			if val == nil {
+				continue
+			}
+			if valueSizeBytes(val) > maxBytes {
+				exceeded[col.name] = struct{}{}
+				if len(exceeded) == len(checkCols) {
+					return exceeded
+				}
+			}
+		}
+	}
+
+	return exceeded
+}
+
+func isBoundsSizedType(fieldType string) bool {
+	switch fieldType {
+	case "utf8", "string", "json":
+		return true
+	default:
+		return false
+	}
+}
+
+func valueForColumn(event map[string]interface{}, col columnInfo, rowJson map[string]*jsonexpand.RowExpansion) interface{} {
+	if !col.isJsonSubcol {
+		return event[col.name]
+	}
+	if col.bucketIdx >= 0 {
+		if expanded := rowJson[col.jsonColName]; expanded != nil {
+			if bucketData := expanded.BucketValues[col.bucketIdx]; bucketData != nil {
+				return bucketData
+			}
+		}
+		return nil
+	}
+	if expanded := rowJson[col.jsonColName]; expanded != nil {
+		if subcolValue, ok := expanded.SubcolumnValues[col.subcolName]; ok && subcolValue != nil {
+			return subcolValue
+		}
+	}
+	return nil
+}
+
+func valueSizeBytes(val interface{}) int {
+	switch v := val.(type) {
+	case string:
+		return len(v)
+	case []byte:
+		return len(v)
+	default:
+		b, _ := json.Marshal(val)
+		return len(b)
 	}
 }
 

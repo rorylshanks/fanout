@@ -47,6 +47,7 @@ sinks:
         rows_per_file: 10000
         max_rows_per_row_group: 1000
         page_buffer_bytes: 65536
+        page_bounds_max_value_bytes: 2048
         use_file_buffer_pool: true
         allow_nullable_fields: true
         sorting_columns:

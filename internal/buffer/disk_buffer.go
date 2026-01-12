@@ -458,7 +458,7 @@ func (m *BufferManager) processFlush(job FlushJob) error {
 	eventCount := job.Buffer.EventCount()
 	byteCount := job.Buffer.ByteCount()
 
-	logging.InfoLog("flush_start", map[string]interface{}{
+	logging.DebugLog("flush_start", map[string]interface{}{
 		"partition": job.PartitionPath,
 		"reason":    string(job.Reason),
 		"events":    eventCount,
@@ -491,7 +491,7 @@ func (m *BufferManager) processFlush(job FlushJob) error {
 		}
 	}
 
-	logging.InfoLog("flush_complete", map[string]interface{}{
+	logging.DebugLog("flush_complete", map[string]interface{}{
 		"partition": job.PartitionPath,
 		"events":    eventCount,
 	})

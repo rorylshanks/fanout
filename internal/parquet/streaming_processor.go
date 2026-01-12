@@ -49,6 +49,11 @@ func NewStreamingProcessor(cfg config.ParquetConfig, tempDir string, bufferDir s
 	}
 }
 
+// SetStageRecorder wires a stage recorder to the parquet writer.
+func (p *StreamingProcessor) SetStageRecorder(recorder ParquetStageRecorder) {
+	p.writer.SetStageRecorder(recorder)
+}
+
 // ProcessBufferToFiles reads a disk buffer and writes multiple parquet files
 // Returns information about each generated file including row counts
 func (p *StreamingProcessor) ProcessBufferToFiles(bufferPath string, outputDir string) ([]ParquetFileInfo, error) {
