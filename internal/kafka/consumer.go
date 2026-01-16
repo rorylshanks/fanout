@@ -36,6 +36,12 @@ type Consumer struct {
 	wg       sync.WaitGroup
 }
 
+const (
+	initialRetryBackoff = 1 * time.Second
+	maxRetryBackoff     = 30 * time.Second
+	startupReadyTimeout = 2 * time.Minute
+)
+
 // NewConsumer creates a new Kafka consumer
 func NewConsumer(src *config.Source, handler MessageHandler) (*Consumer, error) {
 	cfg := sarama.NewConfig()
@@ -76,6 +82,9 @@ func NewConsumer(src *config.Source, handler MessageHandler) (*Consumer, error) 
 	cfg.Consumer.Fetch.Default = int32(fetchDefaultBytes)
 	cfg.Consumer.Fetch.Max = int32(fetchMaxBytes)
 	cfg.Consumer.MaxProcessingTime = time.Duration(maxProcessingMs) * time.Millisecond
+	cfg.Net.DialTimeout = 10 * time.Second
+	cfg.Net.ReadTimeout = 30 * time.Second
+	cfg.Net.WriteTimeout = 30 * time.Second
 
 	// Configure TLS if enabled
 	if src.TLS.Enabled {
@@ -112,6 +121,7 @@ func (c *Consumer) Start() error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		backoff := initialRetryBackoff
 		for {
 			handler := &consumerGroupHandler{
 				handler: c.handler,
@@ -123,18 +133,29 @@ func (c *Consumer) Start() error {
 					return
 				}
 				logging.ErrorLog("kafka_consume_error", map[string]interface{}{"error": err.Error()})
+				time.Sleep(backoff)
+				backoff *= 2
+				if backoff > maxRetryBackoff {
+					backoff = maxRetryBackoff
+				}
+				continue
 			}
 
 			if c.ctx.Err() != nil {
 				return
 			}
 
+			backoff = initialRetryBackoff
 			c.ready = make(chan bool)
 		}
 	}()
 
 	// Wait until consumer is ready
-	<-c.ready
+	select {
+	case <-c.ready:
+	case <-time.After(startupReadyTimeout):
+		return fmt.Errorf("kafka consumer start timeout after %s", startupReadyTimeout)
+	}
 	logging.InfoLog("kafka_consumer_ready", nil)
 
 	// Handle errors in background

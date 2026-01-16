@@ -36,3 +36,4 @@ benchmark-s3.sh
 vector.yml
 bin
 benchmark.sh
+ecs-task-definition.json

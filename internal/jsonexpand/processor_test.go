@@ -232,3 +232,57 @@ func TestProcessBatchEmptyAndNull(t *testing.T) {
 		}
 	}
 }
+
+func TestProcessBatchMaxDepthLimit(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 10,
+		BucketCount:   2,
+		MaxDepth:      1,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	jsonValues := []string{
+		`{"flat": "ok", "nested": {"value": "skip"}}`,
+	}
+
+	result := processor.ProcessBatch(jsonValues)
+
+	if _, ok := result.Subcolumns["data.flat"]; !ok {
+		t.Error("expected data.flat subcolumn")
+	}
+	if _, ok := result.Subcolumns["data.nested.value"]; ok {
+		t.Error("expected nested keys to be excluded due to max depth")
+	}
+}
+
+func TestProcessBatchArrayEncoding(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 10,
+		BucketCount:   2,
+		MaxDepth:      2,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	jsonValues := []string{
+		`{"arr":[1,2,3]}`,
+	}
+
+	result := processor.ProcessBatch(jsonValues)
+	subCol, ok := result.Subcolumns["data.arr"]
+	if !ok {
+		t.Fatal("expected data.arr subcolumn")
+	}
+	if subCol.Type != TypeString {
+		t.Fatalf("expected array to be encoded as string, got %v", subCol.Type)
+	}
+	if len(subCol.Values) != 1 {
+		t.Fatalf("expected 1 value, got %d", len(subCol.Values))
+	}
+	if val, ok := subCol.Values[0].(string); !ok || val != "[1,2,3]" {
+		t.Fatalf("unexpected array encoding: %#v", subCol.Values[0])
+	}
+}

@@ -360,6 +360,7 @@ type BufferManager struct {
 	flushQueue    chan FlushJob
 	flushSem      chan struct{} // Semaphore for concurrent flushes
 	stats         BufferManagerStats
+	lastFlushAt   int64 // unix nanos of last successful flush
 	ctx           context.Context
 	cancel        context.CancelFunc
 	wg            sync.WaitGroup
@@ -490,6 +491,7 @@ func (m *BufferManager) processFlush(job FlushJob) error {
 			return err
 		}
 	}
+	atomic.StoreInt64(&m.lastFlushAt, time.Now().UnixNano())
 
 	logging.DebugLog("flush_complete", map[string]interface{}{
 		"partition": job.PartitionPath,
@@ -607,7 +609,18 @@ func (m *BufferManager) retryWrite(partitionPath string, data []byte, oldBuffer 
 func (m *BufferManager) shouldFlush(buffer *DiskBuffer) bool {
 	return buffer.EventCount() >= m.maxEvents ||
 		buffer.ByteCount() >= m.maxBytes ||
-		buffer.IsExpired()
+		m.isBufferExpired(buffer)
+}
+
+func (m *BufferManager) isBufferExpired(buffer *DiskBuffer) bool {
+	if buffer.MaxAge() <= 0 {
+		return false
+	}
+	lastFlushAt := atomic.LoadInt64(&m.lastFlushAt)
+	if lastFlushAt == 0 {
+		return buffer.Age() >= buffer.MaxAge()
+	}
+	return time.Since(time.Unix(0, lastFlushAt)) >= buffer.MaxAge()
 }
 
 // queueFlushIfSame queues a partition for flushing only if the buffer matches
@@ -762,7 +775,7 @@ func (m *BufferManager) FlushExpired() error {
 	m.mu.RLock()
 	var expired []string
 	for path, buffer := range m.buffers {
-		if buffer.IsExpired() {
+		if m.isBufferExpired(buffer) {
 			expired = append(expired, path)
 		}
 	}
