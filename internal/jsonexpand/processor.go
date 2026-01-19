@@ -68,7 +68,7 @@ type ProcessedJsonColumns struct {
 	ColumnName     string
 	OriginalValues []string // if keep_original_column is true
 	Subcolumns     map[string]*SubcolumnData
-	BucketMaps     [][]map[string]string // bucket_index -> row_index -> key -> value
+	BucketMaps     [][]map[string]interface{} // bucket_index -> row_index -> key -> value
 	BucketCount    int
 	NumRows        int
 }
@@ -85,7 +85,7 @@ type JsonColumnPlan struct {
 // RowExpansion contains JSON subcolumn and bucket values for a single row.
 type RowExpansion struct {
 	SubcolumnValues map[string]interface{} // full column name -> value
-	BucketValues    map[int]map[string]string
+	BucketValues    map[int]map[string]interface{}
 }
 
 // JsonColumnProcessor handles JSON column expansion
@@ -194,7 +194,7 @@ func (p *JsonColumnProcessor) ExpandRow(plan *JsonColumnPlan, jsonStr string) *R
 	p.flattenObject(obj, "", 0, flattened)
 
 	subcolumnValues := make(map[string]interface{})
-	bucketValues := make(map[int]map[string]string)
+	bucketValues := make(map[int]map[string]interface{})
 
 	for key, value := range flattened {
 		if inferredType, ok := plan.SubcolumnKeyTypes[key]; ok {
@@ -207,9 +207,9 @@ func (p *JsonColumnProcessor) ExpandRow(plan *JsonColumnPlan, jsonStr string) *R
 		if plan.OverflowKeys[key] {
 			bucketIdx := p.hashKeyToBucket(key)
 			if bucketValues[bucketIdx] == nil {
-				bucketValues[bucketIdx] = make(map[string]string)
+				bucketValues[bucketIdx] = make(map[string]interface{})
 			}
-			bucketValues[bucketIdx][key] = p.valueToString(value)
+			bucketValues[bucketIdx][key] = value
 		}
 	}
 
@@ -298,9 +298,9 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 	}
 
 	// Initialize bucket maps
-	bucketMaps := make([][]map[string]string, p.config.BucketCount)
+	bucketMaps := make([][]map[string]interface{}, p.config.BucketCount)
 	for i := range bucketMaps {
-		bucketMaps[i] = make([]map[string]string, numRows)
+		bucketMaps[i] = make([]map[string]interface{}, numRows)
 	}
 
 	// Original values
@@ -323,9 +323,9 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 			} else if overflowKeys[key] {
 				bucketIdx := p.hashKeyToBucket(key)
 				if bucketMaps[bucketIdx][rowIdx] == nil {
-					bucketMaps[bucketIdx][rowIdx] = make(map[string]string)
+					bucketMaps[bucketIdx][rowIdx] = make(map[string]interface{})
 				}
-				bucketMaps[bucketIdx][rowIdx][key] = p.valueToString(value)
+				bucketMaps[bucketIdx][rowIdx][key] = value
 			}
 		}
 	}
