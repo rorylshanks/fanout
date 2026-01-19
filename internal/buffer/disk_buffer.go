@@ -350,7 +350,6 @@ type BufferManagerStats struct {
 type BufferManager struct {
 	mu            sync.RWMutex
 	buffers       map[string]*DiskBuffer
-	lastFlushAt   map[string]time.Time
 	baseDir       string
 	maxEvents     int
 	maxBytes      int64
@@ -389,7 +388,6 @@ func NewBufferManagerWithBackpressure(
 
 	m := &BufferManager{
 		buffers:      make(map[string]*DiskBuffer),
-		lastFlushAt:  make(map[string]time.Time),
 		baseDir:      baseDir,
 		maxEvents:    maxEvents,
 		maxBytes:     maxBytes,
@@ -492,9 +490,6 @@ func (m *BufferManager) processFlush(job FlushJob) error {
 			return err
 		}
 	}
-	m.mu.Lock()
-	m.lastFlushAt[job.PartitionPath] = time.Now()
-	m.mu.Unlock()
 
 	logging.DebugLog("flush_complete", map[string]interface{}{
 		"partition": job.PartitionPath,
@@ -559,7 +554,7 @@ func (m *BufferManager) Write(partitionPath string, data []byte) error {
 	atomic.AddInt64(&m.totalBytes, int64(len(data)+4))
 
 	// Check if buffer should be flushed
-	if m.shouldFlush(partitionPath, buffer) {
+	if m.shouldFlush(buffer) {
 		return m.queueFlushIfSame(partitionPath, buffer)
 	}
 
@@ -609,23 +604,10 @@ func (m *BufferManager) retryWrite(partitionPath string, data []byte, oldBuffer 
 }
 
 // shouldFlush checks if a buffer should be flushed
-func (m *BufferManager) shouldFlush(partitionPath string, buffer *DiskBuffer) bool {
+func (m *BufferManager) shouldFlush(buffer *DiskBuffer) bool {
 	return buffer.EventCount() >= m.maxEvents ||
 		buffer.ByteCount() >= m.maxBytes ||
-		m.isBufferExpired(partitionPath, buffer)
-}
-
-func (m *BufferManager) isBufferExpired(partitionPath string, buffer *DiskBuffer) bool {
-	if buffer.MaxAge() <= 0 {
-		return false
-	}
-	m.mu.RLock()
-	lastFlushAt, hasFlush := m.lastFlushAt[partitionPath]
-	m.mu.RUnlock()
-	if !hasFlush {
-		return buffer.Age() >= buffer.MaxAge()
-	}
-	return time.Since(lastFlushAt) >= buffer.MaxAge()
+		buffer.IsExpired()
 }
 
 // queueFlushIfSame queues a partition for flushing only if the buffer matches
@@ -780,7 +762,7 @@ func (m *BufferManager) FlushExpired() error {
 	m.mu.RLock()
 	var expired []string
 	for path, buffer := range m.buffers {
-		if m.isBufferExpired(path, buffer) {
+		if buffer.IsExpired() {
 			expired = append(expired, path)
 		}
 	}

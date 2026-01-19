@@ -100,7 +100,7 @@ func TestBufferManagerFlushBySize(t *testing.T) {
 	}
 }
 
-func TestBufferManagerTimeoutFromLastFlush(t *testing.T) {
+func TestBufferManagerTimeoutFromCreation(t *testing.T) {
 	baseDir := t.TempDir()
 	flushCh := make(chan flushEvent, 10)
 
@@ -124,23 +124,6 @@ func TestBufferManagerTimeoutFromLastFlush(t *testing.T) {
 	if err := manager.Write("p1", []byte(`{"event":"first"}`)); err != nil {
 		t.Fatalf("write p1 event: %v", err)
 	}
-	if err := manager.FlushPartition("p1"); err != nil {
-		t.Fatalf("flush p1: %v", err)
-	}
-
-	ev := waitForFlush(t, flushCh, 2*time.Second)
-	if ev.partition != "p1" {
-		t.Fatalf("expected flush partition 'p1', got %q", ev.partition)
-	}
-
-	flushTime := time.Now()
-
-	if err := manager.Write("p1", []byte(`{"event":"second"}`)); err != nil {
-		t.Fatalf("write p1 second event: %v", err)
-	}
-	if err := manager.Write("p2", []byte(`{"event":"other"}`)); err != nil {
-		t.Fatalf("write p2 event: %v", err)
-	}
 
 	time.Sleep(30 * time.Millisecond)
 	if err := manager.FlushExpired(); err != nil {
@@ -153,23 +136,15 @@ func TestBufferManagerTimeoutFromLastFlush(t *testing.T) {
 	default:
 	}
 
-	for time.Since(flushTime) < maxAge+30*time.Millisecond {
-		time.Sleep(10 * time.Millisecond)
-	}
+	time.Sleep(maxAge + 30*time.Millisecond)
 
 	if err := manager.FlushExpired(); err != nil {
 		t.Fatalf("flush expired after timeout: %v", err)
 	}
 
-	ev = waitForFlush(t, flushCh, 2*time.Second)
+	ev := waitForFlush(t, flushCh, 2*time.Second)
 	if ev.partition != "p1" {
 		t.Fatalf("expected flush partition 'p1', got %q", ev.partition)
-	}
-
-	select {
-	case ev := <-flushCh:
-		t.Fatalf("unexpected flush for %q", ev.partition)
-	default:
 	}
 }
 
