@@ -121,25 +121,26 @@ func TestBufferManagerTimeoutFromLastFlush(t *testing.T) {
 	manager := NewBufferManagerWithBackpressure(baseDir, 100, 10*1024*1024, maxAge, 0, onFlush, bp)
 	defer manager.Stop()
 
-	if err := manager.Write("old", []byte(`{"event":"old"}`)); err != nil {
-		t.Fatalf("write old event: %v", err)
+	if err := manager.Write("p1", []byte(`{"event":"first"}`)); err != nil {
+		t.Fatalf("write p1 event: %v", err)
 	}
-
-	time.Sleep(40 * time.Millisecond)
-
-	if err := manager.Write("new", []byte(`{"event":"new"}`)); err != nil {
-		t.Fatalf("write new event: %v", err)
-	}
-	if err := manager.FlushPartition("new"); err != nil {
-		t.Fatalf("flush new: %v", err)
+	if err := manager.FlushPartition("p1"); err != nil {
+		t.Fatalf("flush p1: %v", err)
 	}
 
 	ev := waitForFlush(t, flushCh, 2*time.Second)
-	if ev.partition != "new" {
-		t.Fatalf("expected flush partition 'new', got %q", ev.partition)
+	if ev.partition != "p1" {
+		t.Fatalf("expected flush partition 'p1', got %q", ev.partition)
 	}
 
 	flushTime := time.Now()
+
+	if err := manager.Write("p1", []byte(`{"event":"second"}`)); err != nil {
+		t.Fatalf("write p1 second event: %v", err)
+	}
+	if err := manager.Write("p2", []byte(`{"event":"other"}`)); err != nil {
+		t.Fatalf("write p2 event: %v", err)
+	}
 
 	time.Sleep(30 * time.Millisecond)
 	if err := manager.FlushExpired(); err != nil {
@@ -161,7 +162,91 @@ func TestBufferManagerTimeoutFromLastFlush(t *testing.T) {
 	}
 
 	ev = waitForFlush(t, flushCh, 2*time.Second)
-	if ev.partition != "old" {
-		t.Fatalf("expected flush partition 'old', got %q", ev.partition)
+	if ev.partition != "p1" {
+		t.Fatalf("expected flush partition 'p1', got %q", ev.partition)
+	}
+
+	select {
+	case ev := <-flushCh:
+		t.Fatalf("unexpected flush for %q", ev.partition)
+	default:
+	}
+}
+
+func TestBufferManagerFlushesOnTimeout(t *testing.T) {
+	baseDir := t.TempDir()
+	flushCh := make(chan flushEvent, 10)
+
+	onFlush := func(partitionPath string, buf *DiskBuffer, reason FlushReason) error {
+		flushCh <- flushEvent{partition: partitionPath, reason: reason}
+		_ = buf.Delete()
+		return nil
+	}
+
+	maxAge := 50 * time.Millisecond
+	bp := BackpressureConfig{
+		MaxPendingFlushes:    10,
+		MaxConcurrentFlushes: 1,
+		MaxOpenFiles:         10,
+		MaxTotalBytes:        10 * 1024 * 1024,
+	}
+
+	manager := NewBufferManagerWithBackpressure(baseDir, 100, 10*1024*1024, maxAge, 0, onFlush, bp)
+	defer manager.Stop()
+
+	if err := manager.Write("timeout", []byte(`{"event":"late"}`)); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	time.Sleep(maxAge + 20*time.Millisecond)
+
+	if err := manager.FlushExpired(); err != nil {
+		t.Fatalf("flush expired: %v", err)
+	}
+
+	ev := waitForFlush(t, flushCh, 2*time.Second)
+	if ev.partition != "timeout" {
+		t.Fatalf("expected flush partition 'timeout', got %q", ev.partition)
+	}
+	if ev.reason != FlushReasonTime {
+		t.Fatalf("expected time flush, got %q", ev.reason)
+	}
+}
+
+func TestBufferManagerPeriodicFlushesOnTimeout(t *testing.T) {
+	baseDir := t.TempDir()
+	flushCh := make(chan flushEvent, 10)
+
+	onFlush := func(partitionPath string, buf *DiskBuffer, reason FlushReason) error {
+		flushCh <- flushEvent{partition: partitionPath, reason: reason}
+		_ = buf.Delete()
+		return nil
+	}
+
+	maxAge := 60 * time.Millisecond
+	bp := BackpressureConfig{
+		MaxPendingFlushes:    10,
+		MaxConcurrentFlushes: 1,
+		MaxOpenFiles:         10,
+		MaxTotalBytes:        10 * 1024 * 1024,
+	}
+
+	manager := NewBufferManagerWithBackpressure(baseDir, 100, 10*1024*1024, maxAge, 0, onFlush, bp)
+	defer manager.Stop()
+
+	stopFlush := make(chan struct{})
+	manager.StartPeriodicFlush(20*time.Millisecond, stopFlush)
+	defer close(stopFlush)
+
+	if err := manager.Write("timeout", []byte(`{"event":"late"}`)); err != nil {
+		t.Fatalf("write event: %v", err)
+	}
+
+	ev := waitForFlush(t, flushCh, 2*time.Second)
+	if ev.partition != "timeout" {
+		t.Fatalf("expected flush partition 'timeout', got %q", ev.partition)
+	}
+	if ev.reason != FlushReasonTime {
+		t.Fatalf("expected time flush, got %q", ev.reason)
 	}
 }
