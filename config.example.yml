@@ -36,6 +36,8 @@ sinks:
       # Backpressure configuration (defaults shown)
       backpressure:
         max_pending_flushes: 100        # Max flush jobs queued before blocking
+        high_watermark_pending: 2048   # Pause ingestion when pending >= this
+        low_watermark_pending: 1024    # Resume ingestion when pending <= this
         max_concurrent_flushes: 4       # Parallel flush workers
         max_open_files: 256             # LRU cache size for buffer file handles
         max_total_bytes: 53687091200    # 50GB - max buffered before backpressure

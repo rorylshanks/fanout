@@ -180,6 +180,16 @@ func (c *Consumer) Ready() <-chan bool {
 	return c.ready
 }
 
+// PauseAll pauses consumption for all assigned partitions.
+func (c *Consumer) PauseAll() {
+	c.client.PauseAll()
+}
+
+// ResumeAll resumes consumption for all assigned partitions.
+func (c *Consumer) ResumeAll() {
+	c.client.ResumeAll()
+}
+
 // consumerGroupHandler implements sarama.ConsumerGroupHandler
 type consumerGroupHandler struct {
 	handler MessageHandler

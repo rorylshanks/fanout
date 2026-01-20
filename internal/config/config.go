@@ -76,6 +76,12 @@ type BackpressureConfig struct {
 	// MaxPendingFlushes is the maximum flush jobs in queue before blocking writes
 	// Default: 100
 	MaxPendingFlushes int `yaml:"max_pending_flushes"`
+	// HighWatermarkPending pauses ingestion when pending flushes exceed this value
+	// Default: 2048
+	HighWatermarkPending int `yaml:"high_watermark_pending"`
+	// LowWatermarkPending resumes ingestion when pending flushes fall below this value
+	// Default: 1024
+	LowWatermarkPending int `yaml:"low_watermark_pending"`
 	// MaxConcurrentFlushes is the number of parallel flush workers
 	// Default: 4
 	MaxConcurrentFlushes int `yaml:"max_concurrent_flushes"`
@@ -178,6 +184,15 @@ func Load(path string) (*Config, error) {
 		// Backpressure defaults
 		if sink.DiskBatching.Backpressure.MaxPendingFlushes == 0 {
 			sink.DiskBatching.Backpressure.MaxPendingFlushes = 100
+		}
+		if sink.DiskBatching.Backpressure.HighWatermarkPending == 0 {
+			sink.DiskBatching.Backpressure.HighWatermarkPending = 2048
+		}
+		if sink.DiskBatching.Backpressure.LowWatermarkPending == 0 {
+			sink.DiskBatching.Backpressure.LowWatermarkPending = 1024
+		}
+		if sink.DiskBatching.Backpressure.LowWatermarkPending >= sink.DiskBatching.Backpressure.HighWatermarkPending {
+			sink.DiskBatching.Backpressure.LowWatermarkPending = sink.DiskBatching.Backpressure.HighWatermarkPending / 2
 		}
 		if sink.DiskBatching.Backpressure.MaxConcurrentFlushes == 0 {
 			sink.DiskBatching.Backpressure.MaxConcurrentFlushes = 4

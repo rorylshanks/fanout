@@ -76,6 +76,8 @@ func TestBufferManagerFlushBySize(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
+		HighWatermarkPending: 8,
+		LowWatermarkPending:  4,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -113,6 +115,8 @@ func TestBufferManagerTimeoutFromCreation(t *testing.T) {
 	maxAge := 80 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
+		HighWatermarkPending: 8,
+		LowWatermarkPending:  4,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -161,6 +165,8 @@ func TestBufferManagerFlushesOnTimeout(t *testing.T) {
 	maxAge := 50 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
+		HighWatermarkPending: 8,
+		LowWatermarkPending:  4,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -201,6 +207,8 @@ func TestBufferManagerPeriodicFlushesOnTimeout(t *testing.T) {
 	maxAge := 60 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
+		HighWatermarkPending: 8,
+		LowWatermarkPending:  4,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,

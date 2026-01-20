@@ -302,6 +302,10 @@ func (p *Pipeline) Run(ctx context.Context) error {
 	stopStats := make(chan struct{})
 	go p.reportStats(stopStats)
 
+	// Start backpressure monitor
+	stopBackpressure := make(chan struct{})
+	go p.monitorBackpressure(consumer, stopBackpressure)
+
 	// Wait for shutdown
 	<-ctx.Done()
 
@@ -333,11 +337,53 @@ func (p *Pipeline) Run(ctx context.Context) error {
 
 	// Stop stats reporting before final summary.
 	close(stopStats)
+	close(stopBackpressure)
 
 	// Final stats
 	p.printFinalStats()
 
 	return nil
+}
+
+func (p *Pipeline) monitorBackpressure(consumer *kafka.Consumer, stop <-chan struct{}) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	paused := false
+
+	for {
+		select {
+		case <-ticker.C:
+			stats := p.bufferManager.Stats()
+			high := p.bpConfig.HighWatermarkPending
+			low := p.bpConfig.LowWatermarkPending
+
+			if high == 0 {
+				high = 2048
+			}
+			if low == 0 || low >= high {
+				low = high / 2
+			}
+
+			if !paused && stats.PendingFlushes >= int64(high) {
+				consumer.PauseAll()
+				paused = true
+				logging.WarnLog("backpressure_pause", map[string]interface{}{
+					"pending": stats.PendingFlushes,
+					"high":    high,
+				})
+			} else if paused && stats.PendingFlushes <= int64(low) {
+				consumer.ResumeAll()
+				paused = false
+				logging.InfoLog("backpressure_resume", map[string]interface{}{
+					"pending": stats.PendingFlushes,
+					"low":     low,
+				})
+			}
+		case <-stop:
+			return
+		}
+	}
 }
 
 // enqueueMessage puts a message on the channel for worker processing

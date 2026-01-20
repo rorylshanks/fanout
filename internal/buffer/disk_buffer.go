@@ -315,6 +315,10 @@ type BackpressureConfig struct {
 	// MaxPendingFlushes is the maximum number of flush jobs that can be queued
 	// When exceeded, Write() will block until space is available
 	MaxPendingFlushes int
+	// HighWatermarkPending pauses ingestion when pending flushes exceed this value
+	HighWatermarkPending int
+	// LowWatermarkPending resumes ingestion when pending flushes fall below this value
+	LowWatermarkPending int
 	// MaxConcurrentFlushes is the number of concurrent flush workers
 	MaxConcurrentFlushes int
 	// MaxOpenFiles is the LRU cache size for open file handles
@@ -328,6 +332,8 @@ type BackpressureConfig struct {
 func DefaultBackpressureConfig() BackpressureConfig {
 	return BackpressureConfig{
 		MaxPendingFlushes:    100,
+		HighWatermarkPending: 2048,
+		LowWatermarkPending:  1024,
 		MaxConcurrentFlushes: 4,
 		MaxOpenFiles:         256,
 		MaxTotalBytes:        50 * 1024 * 1024 * 1024, // 50GB
@@ -891,6 +897,10 @@ func (m *BufferManager) Stats() BufferManagerStats {
 // IsPressured returns true if backpressure is being applied
 func (m *BufferManager) IsPressured() bool {
 	stats := m.Stats()
+	high := m.backpressure.HighWatermarkPending
+	if high == 0 {
+		high = 2048
+	}
 	return stats.TotalBytes >= m.backpressure.MaxTotalBytes/2 ||
-		stats.PendingFlushes >= int64(m.backpressure.MaxPendingFlushes)/2
+		stats.PendingFlushes >= int64(high)
 }
