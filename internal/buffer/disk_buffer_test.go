@@ -526,3 +526,91 @@ func TestBufferManagerFlushPartition(t *testing.T) {
 		t.Errorf("expected 1 active buffer (p2), got %d", stats.ActiveBuffers)
 	}
 }
+
+// TestRetryWriteTriggersFlush verifies that writes going through the retryWrite path
+// (when the original buffer is being flushed) still trigger size-based flushes.
+// This was a bug where retryWrite was missing the shouldFlush check.
+func TestRetryWriteTriggersFlush(t *testing.T) {
+	baseDir := t.TempDir()
+	flushCh := make(chan flushEvent, 10)
+
+	// Use a channel to control when the first flush completes
+	// This ensures writes happen while the first buffer is still flushing
+	firstFlushStarted := make(chan struct{})
+	allowFirstFlushComplete := make(chan struct{})
+	firstFlush := true
+
+	onFlush := func(partitionPath string, buf *DiskBuffer, reason FlushReason) error {
+		if firstFlush {
+			firstFlush = false
+			close(firstFlushStarted) // Signal that first flush has started
+			<-allowFirstFlushComplete // Block until we're ready
+		}
+		flushCh <- flushEvent{partition: partitionPath, reason: reason}
+		_ = buf.Delete()
+		return nil
+	}
+
+	bp := BackpressureConfig{
+		MaxPendingFlushes:    10,
+		HighWatermarkPending: 8,
+		LowWatermarkPending:  4,
+		MaxConcurrentFlushes: 1, // Single worker to ensure predictable ordering
+		MaxOpenFiles:         10,
+		MaxTotalBytes:        10 * 1024 * 1024,
+	}
+
+	// maxEvents=2 means buffer flushes after 2 events
+	manager := NewBufferManagerWithBackpressure(baseDir, 2, 10*1024*1024, time.Hour, 0, onFlush, bp)
+	defer manager.Stop()
+
+	// Write 2 events - this triggers the first flush
+	if err := manager.Write("partition", []byte(`{"event":"1"}`)); err != nil {
+		t.Fatalf("write event 1: %v", err)
+	}
+	if err := manager.Write("partition", []byte(`{"event":"2"}`)); err != nil {
+		t.Fatalf("write event 2: %v", err)
+	}
+
+	// Wait for the first flush to start (buffer is now in flushing state)
+	select {
+	case <-firstFlushStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for first flush to start")
+	}
+
+	// Now write 2 more events while the first buffer is flushing
+	// These writes will go through retryWrite and create a new buffer
+	if err := manager.Write("partition", []byte(`{"event":"3"}`)); err != nil {
+		t.Fatalf("write event 3: %v", err)
+	}
+	if err := manager.Write("partition", []byte(`{"event":"4"}`)); err != nil {
+		t.Fatalf("write event 4: %v", err)
+	}
+
+	// Allow the first flush to complete
+	close(allowFirstFlushComplete)
+
+	// Collect both flushes
+	var flushReasons []FlushReason
+	timeout := time.After(3 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-flushCh:
+			if ev.partition != "partition" {
+				t.Errorf("unexpected partition: %s", ev.partition)
+			}
+			flushReasons = append(flushReasons, ev.reason)
+		case <-timeout:
+			t.Fatalf("timeout waiting for flush %d, got %d flushes", i+1, len(flushReasons))
+		}
+	}
+
+	// Both flushes should be size-based, not time-based
+	// Before the fix, the second flush would only happen on timeout
+	for i, reason := range flushReasons {
+		if reason != FlushReasonSize {
+			t.Errorf("flush %d: expected reason %q, got %q", i+1, FlushReasonSize, reason)
+		}
+	}
+}

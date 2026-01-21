@@ -606,6 +606,12 @@ func (m *BufferManager) retryWrite(partitionPath string, data []byte, oldBuffer 
 	}
 
 	atomic.AddInt64(&m.totalBytes, int64(len(data)+4))
+
+	// Check if buffer should be flushed
+	if m.shouldFlush(target) {
+		return m.queueFlushIfSame(partitionPath, target)
+	}
+
 	return nil
 }
 
@@ -901,6 +907,5 @@ func (m *BufferManager) IsPressured() bool {
 	if high == 0 {
 		high = 2048
 	}
-	return stats.TotalBytes >= m.backpressure.MaxTotalBytes/2 ||
-		stats.PendingFlushes >= int64(high)
+	return stats.PendingFlushes >= int64(high)
 }
