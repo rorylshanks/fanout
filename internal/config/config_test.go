@@ -96,3 +96,151 @@ func TestParseBootstrapServers(t *testing.T) {
 		t.Fatalf("unexpected servers: %v", servers)
 	}
 }
+
+func TestMinMaxIndexDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yml")
+
+	configYAML := `
+sources:
+  input:
+    type: kafka
+    topics: ["events"]
+    bootstrap_servers: "broker1:9092"
+    group_id: "group1"
+sinks:
+  out:
+    type: aws_s3
+    bucket: "test-bucket"
+    region: "us-east-1"
+    encoding:
+      parquet:
+        schema:
+          event: {type: "utf8"}
+          timestamp: {type: "timestamp_ms"}
+`
+	if err := os.WriteFile(cfgPath, []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	sink := cfg.Sinks["out"]
+
+	// MinMaxIndex should default to true for all fields
+	for name, field := range sink.Encoding.Parquet.Schema {
+		if field.MinMaxIndex == nil {
+			t.Errorf("expected MinMaxIndex to be set for field %q", name)
+		} else if !*field.MinMaxIndex {
+			t.Errorf("expected MinMaxIndex to default to true for field %q", name)
+		}
+	}
+}
+
+func TestMinMaxIndexExplicitFalse(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yml")
+
+	configYAML := `
+sources:
+  input:
+    type: kafka
+    topics: ["events"]
+    bootstrap_servers: "broker1:9092"
+    group_id: "group1"
+sinks:
+  out:
+    type: aws_s3
+    bucket: "test-bucket"
+    region: "us-east-1"
+    encoding:
+      parquet:
+        schema:
+          event: {type: "utf8", minmax_index: false}
+          timestamp: {type: "timestamp_ms", minmax_index: true}
+          data: {type: "utf8"}
+`
+	if err := os.WriteFile(cfgPath, []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	sink := cfg.Sinks["out"]
+
+	// event should have minmax_index = false
+	eventField := sink.Encoding.Parquet.Schema["event"]
+	if eventField.MinMaxIndex == nil || *eventField.MinMaxIndex {
+		t.Errorf("expected event MinMaxIndex to be false, got %v", eventField.MinMaxIndex)
+	}
+
+	// timestamp should have minmax_index = true (explicitly set)
+	timestampField := sink.Encoding.Parquet.Schema["timestamp"]
+	if timestampField.MinMaxIndex == nil || !*timestampField.MinMaxIndex {
+		t.Errorf("expected timestamp MinMaxIndex to be true, got %v", timestampField.MinMaxIndex)
+	}
+
+	// data should have minmax_index = true (default)
+	dataField := sink.Encoding.Parquet.Schema["data"]
+	if dataField.MinMaxIndex == nil || !*dataField.MinMaxIndex {
+		t.Errorf("expected data MinMaxIndex to default to true, got %v", dataField.MinMaxIndex)
+	}
+}
+
+func TestDynamicColumnsConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.yml")
+
+	configYAML := `
+sources:
+  input:
+    type: kafka
+    topics: ["events"]
+    bootstrap_servers: "broker1:9092"
+    group_id: "group1"
+sinks:
+  out:
+    type: aws_s3
+    bucket: "test-bucket"
+    region: "us-east-1"
+    encoding:
+      parquet:
+        dynamic_columns:
+          inserted_at: current_time
+          _timestamp: kafka_time
+          custom_offset: kafka_offset
+        schema:
+          event: {type: "utf8"}
+`
+	if err := os.WriteFile(cfgPath, []byte(configYAML), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	sink := cfg.Sinks["out"]
+	dc := sink.Encoding.Parquet.DynamicColumns
+
+	if len(dc) != 3 {
+		t.Fatalf("expected 3 dynamic columns, got %d", len(dc))
+	}
+
+	if dc["inserted_at"] != "current_time" {
+		t.Errorf("expected inserted_at=current_time, got %s", dc["inserted_at"])
+	}
+	if dc["_timestamp"] != "kafka_time" {
+		t.Errorf("expected _timestamp=kafka_time, got %s", dc["_timestamp"])
+	}
+	if dc["custom_offset"] != "kafka_offset" {
+		t.Errorf("expected custom_offset=kafka_offset, got %s", dc["custom_offset"])
+	}
+}

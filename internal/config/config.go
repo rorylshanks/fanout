@@ -112,6 +112,7 @@ type ParquetConfig struct {
 	UseMemoryMappedFiles    bool                      `yaml:"use_memory_mapped_files"`
 	SortingColumns          []SortingColumn           `yaml:"sorting_columns"`
 	JsonColumns             []JsonColumnConfig        `yaml:"json_columns"`
+	DynamicColumns          map[string]string         `yaml:"dynamic_columns"`
 	Schema                  map[string]SchemaField    `yaml:"schema"`
 }
 
@@ -135,6 +136,7 @@ type SchemaField struct {
 	Type                         string `yaml:"type"`
 	BloomFilter                  bool   `yaml:"bloom_filter"`
 	BloomFilterNumDistinctValues int    `yaml:"bloom_filter_num_distinct_values"`
+	MinMaxIndex                  *bool  `yaml:"minmax_index"`
 }
 
 // SchemaFieldWithName wraps a schema field with its name
@@ -229,6 +231,13 @@ func Load(path string) (*Config, error) {
 			}
 			if jc.MaxDepth == 0 {
 				jc.MaxDepth = 10
+			}
+		}
+		for name, field := range sink.Encoding.Parquet.Schema {
+			if field.MinMaxIndex == nil {
+				enabled := true
+				field.MinMaxIndex = &enabled
+				sink.Encoding.Parquet.Schema[name] = field
 			}
 		}
 		cfg.Sinks[name] = sink

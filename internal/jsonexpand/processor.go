@@ -69,6 +69,7 @@ type ProcessedJsonColumns struct {
 	OriginalValues []string // if keep_original_column is true
 	Subcolumns     map[string]*SubcolumnData
 	BucketMaps     [][]map[string]interface{} // bucket_index -> row_index -> key -> value
+	JsonKeys       [][]string                // row_index -> json key names
 	BucketCount    int
 	NumRows        int
 }
@@ -86,11 +87,20 @@ type JsonColumnPlan struct {
 type RowExpansion struct {
 	SubcolumnValues map[string]interface{} // full column name -> value
 	BucketValues    map[int]map[string]interface{}
+	JsonKeys        []string
 }
 
 // JsonColumnProcessor handles JSON column expansion
 type JsonColumnProcessor struct {
 	config config.JsonColumnConfig
+}
+
+const maxSubcolumnDepth = 5
+
+// FlattenedValue captures a flattened JSON value and its depth.
+type FlattenedValue struct {
+	Value interface{}
+	Depth int
 }
 
 // NewJsonColumnProcessor creates a new processor
@@ -107,6 +117,7 @@ func (p *JsonColumnProcessor) ColumnName() string {
 func (p *JsonColumnProcessor) BuildPlan(jsonValues []string) *JsonColumnPlan {
 	// Pass 1: Scan keys to determine schema
 	keyStats := make(map[string]*KeyStats)
+	keyDepths := make(map[string]int)
 
 	for _, jsonStr := range jsonValues {
 		if jsonStr == "" {
@@ -121,11 +132,11 @@ func (p *JsonColumnProcessor) BuildPlan(jsonValues []string) *JsonColumnPlan {
 			continue
 		}
 
-		flattened := make(map[string]interface{})
+		flattened := make(map[string]FlattenedValue)
 		p.flattenObject(obj, "", 0, flattened)
 
-		for key, value := range flattened {
-			inferredType := p.inferType(value)
+		for key, entry := range flattened {
+			inferredType := p.inferType(entry.Value)
 			if stats, ok := keyStats[key]; ok {
 				stats.Count++
 				stats.InferredType = resolveTypeConflict(stats.InferredType, inferredType)
@@ -134,6 +145,9 @@ func (p *JsonColumnProcessor) BuildPlan(jsonValues []string) *JsonColumnPlan {
 					Count:        1,
 					InferredType: inferredType,
 				}
+			}
+			if entry.Depth > keyDepths[key] {
+				keyDepths[key] = entry.Depth
 			}
 		}
 	}
@@ -158,7 +172,16 @@ func (p *JsonColumnProcessor) BuildPlan(jsonValues []string) *JsonColumnPlan {
 	overflowKeys := make(map[string]bool)
 	subcolumnTypes := make(map[string]InferredType)
 
-	for i, kf := range sortedKeys {
+	eligibleKeys := make([]keyFreq, 0, len(sortedKeys))
+	for _, kf := range sortedKeys {
+		if keyDepths[kf.key] > maxSubcolumnDepth {
+			overflowKeys[kf.key] = true
+			continue
+		}
+		eligibleKeys = append(eligibleKeys, kf)
+	}
+
+	for i, kf := range eligibleKeys {
 		if i < p.config.MaxSubcolumns {
 			subcolumnKeyTypes[kf.key] = kf.stats.InferredType
 			fullKey := p.config.Column + "." + kf.key
@@ -190,16 +213,26 @@ func (p *JsonColumnProcessor) ExpandRow(plan *JsonColumnPlan, jsonStr string) *R
 		return nil
 	}
 
-	flattened := make(map[string]interface{})
+	flattened := make(map[string]FlattenedValue)
 	p.flattenObject(obj, "", 0, flattened)
 
 	subcolumnValues := make(map[string]interface{})
 	bucketValues := make(map[int]map[string]interface{})
+	jsonKeys := make([]string, 0, len(flattened))
 
-	for key, value := range flattened {
+	for key, entry := range flattened {
+		jsonKeys = append(jsonKeys, key)
+		if entry.Depth > maxSubcolumnDepth {
+			bucketIdx := p.hashKeyToBucket(key)
+			if bucketValues[bucketIdx] == nil {
+				bucketValues[bucketIdx] = make(map[string]interface{})
+			}
+			bucketValues[bucketIdx][key] = entry.Value
+			continue
+		}
 		if inferredType, ok := plan.SubcolumnKeyTypes[key]; ok {
 			fullKey := plan.ColumnName + "." + key
-			if converted := p.convertValue(value, inferredType); converted != nil {
+			if converted := p.convertValue(entry.Value, inferredType); converted != nil {
 				subcolumnValues[fullKey] = converted
 			}
 			continue
@@ -209,13 +242,15 @@ func (p *JsonColumnProcessor) ExpandRow(plan *JsonColumnPlan, jsonStr string) *R
 			if bucketValues[bucketIdx] == nil {
 				bucketValues[bucketIdx] = make(map[string]interface{})
 			}
-			bucketValues[bucketIdx][key] = value
+			bucketValues[bucketIdx][key] = entry.Value
 		}
 	}
+	sort.Strings(jsonKeys)
 
 	return &RowExpansion{
 		SubcolumnValues: subcolumnValues,
 		BucketValues:    bucketValues,
+		JsonKeys:        jsonKeys,
 	}
 }
 
@@ -225,7 +260,8 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 
 	// Pass 1: Scan keys to determine schema
 	keyStats := make(map[string]*KeyStats)
-	parsedRows := make([]map[string]interface{}, numRows)
+	parsedRows := make([]map[string]FlattenedValue, numRows)
+	keyDepths := make(map[string]int)
 
 	for rowIdx, jsonStr := range jsonValues {
 		if jsonStr == "" {
@@ -240,12 +276,12 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 			continue
 		}
 
-		flattened := make(map[string]interface{})
+		flattened := make(map[string]FlattenedValue)
 		p.flattenObject(obj, "", 0, flattened)
 		parsedRows[rowIdx] = flattened
 
-		for key, value := range flattened {
-			inferredType := p.inferType(value)
+		for key, entry := range flattened {
+			inferredType := p.inferType(entry.Value)
 			if stats, ok := keyStats[key]; ok {
 				stats.Count++
 				stats.InferredType = resolveTypeConflict(stats.InferredType, inferredType)
@@ -254,6 +290,9 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 					Count:        1,
 					InferredType: inferredType,
 				}
+			}
+			if entry.Depth > keyDepths[key] {
+				keyDepths[key] = entry.Depth
 			}
 		}
 	}
@@ -278,7 +317,16 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 	subcolumnKeys := make(map[string]bool)
 	overflowKeys := make(map[string]bool)
 
-	for i, kf := range sortedKeys {
+	eligibleKeys := make([]keyFreq, 0, len(sortedKeys))
+	for _, kf := range sortedKeys {
+		if keyDepths[kf.key] > maxSubcolumnDepth {
+			overflowKeys[kf.key] = true
+			continue
+		}
+		eligibleKeys = append(eligibleKeys, kf)
+	}
+
+	for i, kf := range eligibleKeys {
 		if i < p.config.MaxSubcolumns {
 			subcolumnKeys[kf.key] = true
 		} else {
@@ -309,6 +357,7 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 		originalValues = make([]string, numRows)
 		copy(originalValues, jsonValues)
 	}
+	jsonKeys := make([][]string, numRows)
 
 	// Populate subcolumns and bucket maps
 	for rowIdx, flattened := range parsedRows {
@@ -316,18 +365,22 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 			continue
 		}
 
-		for key, value := range flattened {
+		rowKeys := make([]string, 0, len(flattened))
+		for key, entry := range flattened {
+			rowKeys = append(rowKeys, key)
 			if subcolumnKeys[key] {
 				fullKey := p.config.Column + "." + key
-				subcolumns[fullKey].Values[rowIdx] = p.convertValue(value, keyStats[key].InferredType)
+				subcolumns[fullKey].Values[rowIdx] = p.convertValue(entry.Value, keyStats[key].InferredType)
 			} else if overflowKeys[key] {
 				bucketIdx := p.hashKeyToBucket(key)
 				if bucketMaps[bucketIdx][rowIdx] == nil {
 					bucketMaps[bucketIdx][rowIdx] = make(map[string]interface{})
 				}
-				bucketMaps[bucketIdx][rowIdx][key] = value
+				bucketMaps[bucketIdx][rowIdx][key] = entry.Value
 			}
 		}
+		sort.Strings(rowKeys)
+		jsonKeys[rowIdx] = rowKeys
 	}
 
 	return &ProcessedJsonColumns{
@@ -335,17 +388,14 @@ func (p *JsonColumnProcessor) ProcessBatch(jsonValues []string) *ProcessedJsonCo
 		OriginalValues: originalValues,
 		Subcolumns:     subcolumns,
 		BucketMaps:     bucketMaps,
+		JsonKeys:       jsonKeys,
 		BucketCount:    p.config.BucketCount,
 		NumRows:        numRows,
 	}
 }
 
 // flattenObject flattens a nested JSON object into dot-separated keys
-func (p *JsonColumnProcessor) flattenObject(obj map[string]interface{}, prefix string, depth int, result map[string]interface{}) {
-	if depth >= p.config.MaxDepth {
-		return
-	}
-
+func (p *JsonColumnProcessor) flattenObject(obj map[string]interface{}, prefix string, depth int, result map[string]FlattenedValue) {
 	for key, value := range obj {
 		fullKey := key
 		if prefix != "" {
@@ -358,10 +408,10 @@ func (p *JsonColumnProcessor) flattenObject(obj map[string]interface{}, prefix s
 		case []interface{}:
 			// Arrays are serialized as JSON strings
 			if jsonBytes, err := json.Marshal(v); err == nil {
-				result[fullKey] = string(jsonBytes)
+				result[fullKey] = FlattenedValue{Value: string(jsonBytes), Depth: depth}
 			}
 		default:
-			result[fullKey] = value
+			result[fullKey] = FlattenedValue{Value: value, Depth: depth}
 		}
 	}
 }

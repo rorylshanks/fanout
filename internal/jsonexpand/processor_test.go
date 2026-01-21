@@ -233,7 +233,7 @@ func TestProcessBatchEmptyAndNull(t *testing.T) {
 	}
 }
 
-func TestProcessBatchMaxDepthLimit(t *testing.T) {
+func TestProcessBatchFlattensAllDepths(t *testing.T) {
 	cfg := config.JsonColumnConfig{
 		Column:        "data",
 		MaxSubcolumns: 10,
@@ -252,8 +252,74 @@ func TestProcessBatchMaxDepthLimit(t *testing.T) {
 	if _, ok := result.Subcolumns["data.flat"]; !ok {
 		t.Error("expected data.flat subcolumn")
 	}
-	if _, ok := result.Subcolumns["data.nested.value"]; ok {
-		t.Error("expected nested keys to be excluded due to max depth")
+	if _, ok := result.Subcolumns["data.nested.value"]; !ok {
+		t.Error("expected nested keys to be flattened regardless of depth")
+	}
+}
+
+func TestProcessBatchDepthBuckets(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 10,
+		BucketCount:   2,
+		MaxDepth:      10,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	jsonValues := []string{
+		`{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}`,
+	}
+
+	result := processor.ProcessBatch(jsonValues)
+	deepKey := "data.a.b.c.d.e.f.g"
+
+	if _, ok := result.Subcolumns[deepKey]; ok {
+		t.Error("expected deep key to be bucketed, not a subcolumn")
+	}
+
+	found := false
+	for _, bucket := range result.BucketMaps {
+		if len(bucket) == 0 || bucket[0] == nil {
+			continue
+		}
+		if _, ok := bucket[0]["a.b.c.d.e.f.g"]; ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected deep key to be present in bucketed columns")
+	}
+}
+
+func TestProcessBatchJsonKeys(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 10,
+		BucketCount:   2,
+		MaxDepth:      3,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	jsonValues := []string{
+		`{"b":{"c":2},"a":1}`,
+	}
+
+	result := processor.ProcessBatch(jsonValues)
+	if result.JsonKeys == nil || len(result.JsonKeys) != 1 {
+		t.Fatalf("expected 1 json_keys row, got %#v", result.JsonKeys)
+	}
+	expected := []string{"a", "b.c"}
+	got := result.JsonKeys[0]
+	if len(got) != len(expected) {
+		t.Fatalf("expected %d json keys, got %d", len(expected), len(got))
+	}
+	for i, key := range expected {
+		if got[i] != key {
+			t.Fatalf("expected json key %q at index %d, got %q", key, i, got[i])
+		}
 	}
 }
 
@@ -284,5 +350,158 @@ func TestProcessBatchArrayEncoding(t *testing.T) {
 	}
 	if val, ok := subCol.Values[0].(string); !ok || val != "[1,2,3]" {
 		t.Fatalf("unexpected array encoding: %#v", subCol.Values[0])
+	}
+}
+
+func TestExpandRowJsonKeys(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "props",
+		MaxSubcolumns: 5,
+		BucketCount:   4,
+		MaxDepth:      10,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	// Build a plan first
+	jsonValues := []string{
+		`{"z":1,"a":2,"m":{"nested":3}}`,
+	}
+	plan := processor.BuildPlan(jsonValues)
+
+	// Expand a single row
+	result := processor.ExpandRow(plan, `{"z":1,"a":2,"m":{"nested":3}}`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// JsonKeys should be sorted alphabetically
+	expected := []string{"a", "m.nested", "z"}
+	if len(result.JsonKeys) != len(expected) {
+		t.Fatalf("expected %d json keys, got %d: %v", len(expected), len(result.JsonKeys), result.JsonKeys)
+	}
+	for i, key := range expected {
+		if result.JsonKeys[i] != key {
+			t.Errorf("expected json key %q at index %d, got %q", key, i, result.JsonKeys[i])
+		}
+	}
+}
+
+func TestExpandRowSubcolumnsAndBuckets(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 2, // Only 2 subcolumns
+		BucketCount:   4,
+		MaxDepth:      10,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	// Build plan with multiple keys
+	jsonValues := []string{
+		`{"a":1,"b":2,"c":3,"d":4}`,
+	}
+	plan := processor.BuildPlan(jsonValues)
+
+	// Expand a row
+	result := processor.ExpandRow(plan, `{"a":1,"b":2,"c":3,"d":4}`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// Should have at most 2 subcolumns
+	if len(result.SubcolumnValues) > 2 {
+		t.Errorf("expected at most 2 subcolumn values, got %d", len(result.SubcolumnValues))
+	}
+
+	// Overflow keys should be in buckets
+	totalBucketed := 0
+	for _, bucketMap := range result.BucketValues {
+		totalBucketed += len(bucketMap)
+	}
+	if totalBucketed != 2 {
+		t.Errorf("expected 2 bucketed values, got %d", totalBucketed)
+	}
+}
+
+func TestExpandRowDeepKeysBucketed(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 10,
+		BucketCount:   4,
+		MaxDepth:      10,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+
+	// Deep nested structure (depth > maxSubcolumnDepth=5)
+	jsonValues := []string{
+		`{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}`,
+	}
+	plan := processor.BuildPlan(jsonValues)
+
+	result := processor.ExpandRow(plan, `{"a":{"b":{"c":{"d":{"e":{"f":{"g":1}}}}}}}`)
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	// Deep key should NOT be in subcolumns
+	deepKey := "data.a.b.c.d.e.f.g"
+	if _, ok := result.SubcolumnValues[deepKey]; ok {
+		t.Error("expected deep key to be bucketed, not in subcolumns")
+	}
+
+	// Deep key should be in a bucket
+	found := false
+	for _, bucketMap := range result.BucketValues {
+		if _, ok := bucketMap["a.b.c.d.e.f.g"]; ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected deep key to be in bucket values")
+	}
+
+	// JsonKeys should still include the deep key
+	hasDeepKey := false
+	for _, key := range result.JsonKeys {
+		if key == "a.b.c.d.e.f.g" {
+			hasDeepKey = true
+			break
+		}
+	}
+	if !hasDeepKey {
+		t.Errorf("expected JsonKeys to include deep key, got: %v", result.JsonKeys)
+	}
+}
+
+func TestExpandRowEmptyAndInvalid(t *testing.T) {
+	cfg := config.JsonColumnConfig{
+		Column:        "data",
+		MaxSubcolumns: 5,
+		BucketCount:   4,
+		MaxDepth:      10,
+	}
+
+	processor := NewJsonColumnProcessor(cfg)
+	plan := processor.BuildPlan([]string{`{"a":1}`})
+
+	// Empty string
+	result := processor.ExpandRow(plan, "")
+	if result != nil {
+		t.Error("expected nil for empty string")
+	}
+
+	// Invalid JSON
+	result = processor.ExpandRow(plan, "not json")
+	if result != nil {
+		t.Error("expected nil for invalid JSON")
+	}
+
+	// Non-object JSON
+	result = processor.ExpandRow(plan, `[1,2,3]`)
+	if result != nil {
+		t.Error("expected nil for non-object JSON")
 	}
 }

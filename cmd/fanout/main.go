@@ -10,7 +10,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -195,7 +197,19 @@ type Pipeline struct {
 	workerWg          sync.WaitGroup
 	parserPool        sync.Pool
 	bufferPool        sync.Pool
+
+	dynamicColumns     map[string]dynamicColumnSource
+	dynamicColumnOrder []string
 }
+
+type dynamicColumnSource int
+
+const (
+	dynamicColumnKafkaTime dynamicColumnSource = iota
+	dynamicColumnCurrentTime
+	dynamicColumnKafkaOffset
+	dynamicColumnKafkaPartition
+)
 
 // NewPipeline creates a new pipeline
 func NewPipeline(
@@ -222,6 +236,8 @@ func NewPipeline(
 	if sinkCfg.Request.Concurrency > 0 {
 		uploadConcurrency = sinkCfg.Request.Concurrency
 	}
+
+	dynamicColumns, dynamicColumnOrder := parseDynamicColumns(sinkCfg.Encoding.Parquet.DynamicColumns)
 
 	// Initialize Prometheus metrics
 	prom := metrics.New("fanout")
@@ -251,6 +267,8 @@ func NewPipeline(
 				return bytes.NewBuffer(make([]byte, 0, 16*1024))
 			},
 		},
+		dynamicColumns:     dynamicColumns,
+		dynamicColumnOrder: dynamicColumnOrder,
 		metrics: Metrics{
 			lastSnapshot: time.Now(),
 		},
@@ -258,6 +276,57 @@ func NewPipeline(
 
 	pipeline.streamingProcessor.SetStageRecorder(pipeline.recordParquetStage)
 	return pipeline
+}
+
+func parseDynamicColumns(cfg map[string]string) (map[string]dynamicColumnSource, []string) {
+	columns := make(map[string]dynamicColumnSource, len(cfg)+3)
+	for name, source := range cfg {
+		switch strings.ToLower(source) {
+		case "kafka_time":
+			columns[name] = dynamicColumnKafkaTime
+		case "current_time":
+			columns[name] = dynamicColumnCurrentTime
+		case "kafka_offset":
+			columns[name] = dynamicColumnKafkaOffset
+		case "kafka_partition":
+			columns[name] = dynamicColumnKafkaPartition
+		default:
+			logging.WarnLog("dynamic_column_unknown_source", map[string]interface{}{
+				"column": name,
+				"source": source,
+			})
+		}
+	}
+
+	if _, ok := columns["_timestamp"]; !ok {
+		columns["_timestamp"] = dynamicColumnKafkaTime
+	}
+	if _, ok := columns["_offset"]; !ok {
+		columns["_offset"] = dynamicColumnKafkaOffset
+	}
+	if _, ok := columns["_partition"]; !ok {
+		columns["_partition"] = dynamicColumnKafkaPartition
+	}
+
+	order := make([]string, 0, len(columns))
+	preferred := []string{"_timestamp", "_offset", "_partition"}
+	for _, name := range preferred {
+		if _, ok := columns[name]; ok {
+			order = append(order, name)
+		}
+	}
+
+	other := make([]string, 0, len(columns))
+	for name := range columns {
+		if name == "_timestamp" || name == "_offset" || name == "_partition" {
+			continue
+		}
+		other = append(other, name)
+	}
+	sort.Strings(other)
+	order = append(order, other...)
+
+	return columns, order
 }
 
 // Run starts the pipeline
@@ -438,14 +507,39 @@ func (p *Pipeline) processMessage(parser *fastjson.Parser, msg *kafka.Message) {
 	// This is faster than parse->modify->serialize
 	buf.WriteByte('{')
 
-	// Add Kafka metadata first
-	buf.WriteString(`"_timestamp":"`)
-	buf.WriteString(time.UnixMilli(msg.Timestamp).Format(time.RFC3339Nano))
-	buf.WriteString(`","_offset":`)
+	// Add dynamic columns first
+	var kafkaTimeStr string
+	var currentTimeStr string
 	var numBuf [20]byte
-	buf.Write(strconv.AppendInt(numBuf[:0], msg.Offset, 10))
-	buf.WriteString(`,"_partition":`)
-	buf.Write(strconv.AppendInt(numBuf[:0], int64(msg.Partition), 10))
+	for i, name := range p.dynamicColumnOrder {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteByte('"')
+		buf.WriteString(name)
+		buf.WriteString(`":`)
+		switch p.dynamicColumns[name] {
+		case dynamicColumnKafkaTime:
+			if kafkaTimeStr == "" {
+				kafkaTimeStr = time.UnixMilli(msg.Timestamp).Format(time.RFC3339Nano)
+			}
+			buf.WriteByte('"')
+			buf.WriteString(kafkaTimeStr)
+			buf.WriteByte('"')
+		case dynamicColumnCurrentTime:
+			if currentTimeStr == "" {
+				currentTimeStr = time.Now().UTC().Format(time.RFC3339Nano)
+			}
+			buf.WriteByte('"')
+			buf.WriteString(currentTimeStr)
+			buf.WriteByte('"')
+		case dynamicColumnKafkaOffset:
+			buf.Write(strconv.AppendInt(numBuf[:0], msg.Offset, 10))
+		case dynamicColumnKafkaPartition:
+			buf.Write(strconv.AppendInt(numBuf[:0], int64(msg.Partition), 10))
+		default:
+		}
+	}
 
 	// Copy all existing fields
 	obj, _ := v.Object()

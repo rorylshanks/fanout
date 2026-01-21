@@ -63,6 +63,11 @@ sinks:
             bucket_count: 256
             max_depth: 10
             keep_original_column: true
+        dynamic_columns:
+          inserted_at: current_time
+          _timestamp: kafka_time
+          _offset: kafka_offset
+          _partition: kafka_partition
         schema:
           uuid:
             type: utf8

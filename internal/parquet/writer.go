@@ -71,9 +71,11 @@ type columnInfo struct {
 	name         string
 	fieldType    string
 	isJsonSubcol bool   // true if this is an expanded JSON subcolumn
+	isJsonKeys   bool   // true if this is the json_keys column for a JSON column
 	jsonColName  string // parent JSON column name (for subcolumns)
 	subcolName   string // subcolumn name within processed data
 	bucketIdx    int    // bucket index (-1 if not a bucket column)
+	skipBounds   bool   // true if min/max indexes should be skipped
 }
 
 // WriteEvents writes events to the given writer
@@ -111,10 +113,15 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 	columns := make([]columnInfo, 0, len(w.schemaFields)+32)
 
 	for _, sf := range w.schemaFields {
+		skipBounds := false
+		if sf.Field.MinMaxIndex != nil && !*sf.Field.MinMaxIndex {
+			skipBounds = true
+		}
 		columns = append(columns, columnInfo{
 			name:      sf.Name,
 			fieldType: sf.Field.Type,
 			bucketIdx: -1,
+			skipBounds: skipBounds,
 		})
 	}
 
@@ -140,6 +147,14 @@ func (w *Writer) WriteEvents(out io.Writer, events []map[string]interface{}) err
 				bucketIdx:    bucketIdx,
 			})
 		}
+		columns = append(columns, columnInfo{
+			name:         plan.ColumnName + "__json_keys",
+			fieldType:    "json",
+			isJsonSubcol: true,
+			isJsonKeys:   true,
+			jsonColName:  plan.ColumnName,
+			bucketIdx:    -1,
+		})
 	}
 
 	// Sort columns by name
@@ -323,8 +338,22 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 	}
 	if w.config.PageBoundsMaxValueBytes > 0 {
 		skipBounds := w.columnsExceedingPageBounds(events, columns, jsonPlans, jsonProcessors, w.config.PageBoundsMaxValueBytes)
+		for _, col := range columns {
+			if col.bucketIdx >= 0 || col.isJsonKeys || col.skipBounds {
+				if skipBounds == nil {
+					skipBounds = make(map[string]struct{})
+				}
+				skipBounds[col.name] = struct{}{}
+			}
+		}
 		for name := range skipBounds {
 			writerOptions = append(writerOptions, goparquet.SkipPageBounds(name))
+		}
+	} else {
+		for _, col := range columns {
+			if col.bucketIdx >= 0 || col.isJsonKeys || col.skipBounds {
+				writerOptions = append(writerOptions, goparquet.SkipPageBounds(col.name))
+			}
 		}
 	}
 	if w.config.MaxRowsPerRowGroup > 0 {
@@ -388,6 +417,10 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 				if !col.isJsonSubcol {
 					// Regular column - direct lookup
 					val = event[col.name]
+				} else if col.isJsonKeys {
+					if expanded := rowJson[col.jsonColName]; expanded != nil {
+						val = expanded.JsonKeys
+					}
 				} else if col.bucketIdx >= 0 {
 					// JSON bucket column
 					if expanded := rowJson[col.jsonColName]; expanded != nil {
@@ -627,6 +660,9 @@ func (w *Writer) columnsExceedingPageBounds(events []map[string]interface{}, col
 	checkCols := make([]columnInfo, 0, len(columns))
 	needsJSON := false
 	for _, col := range columns {
+		if col.skipBounds || col.bucketIdx >= 0 || col.isJsonKeys {
+			continue
+		}
 		if !isBoundsSizedType(col.fieldType) {
 			continue
 		}
@@ -687,6 +723,12 @@ func isBoundsSizedType(fieldType string) bool {
 func valueForColumn(event map[string]interface{}, col columnInfo, rowJson map[string]*jsonexpand.RowExpansion) interface{} {
 	if !col.isJsonSubcol {
 		return event[col.name]
+	}
+	if col.isJsonKeys {
+		if expanded := rowJson[col.jsonColName]; expanded != nil {
+			return expanded.JsonKeys
+		}
+		return nil
 	}
 	if col.bucketIdx >= 0 {
 		if expanded := rowJson[col.jsonColName]; expanded != nil {
