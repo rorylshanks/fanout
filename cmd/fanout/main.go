@@ -146,6 +146,8 @@ func main() {
 	// Configure backpressure from config file
 	bpConfig := buffer.BackpressureConfig{
 		MaxPendingFlushes:    sinkCfg.DiskBatching.Backpressure.MaxPendingFlushes,
+		HighWatermarkBytes:   sinkCfg.DiskBatching.Backpressure.HighWatermarkBytes,
+		LowWatermarkBytes:    sinkCfg.DiskBatching.Backpressure.LowWatermarkBytes,
 		MaxConcurrentFlushes: sinkCfg.DiskBatching.Backpressure.MaxConcurrentFlushes,
 		MaxOpenFiles:         sinkCfg.DiskBatching.Backpressure.MaxOpenFiles,
 		MaxTotalBytes:        sinkCfg.DiskBatching.Backpressure.MaxTotalBytes,
@@ -424,29 +426,29 @@ func (p *Pipeline) monitorBackpressure(consumer *kafka.Consumer, stop <-chan str
 		select {
 		case <-ticker.C:
 			stats := p.bufferManager.Stats()
-			high := p.bpConfig.HighWatermarkPending
-			low := p.bpConfig.LowWatermarkPending
+			high := p.bpConfig.HighWatermarkBytes
+			low := p.bpConfig.LowWatermarkBytes
 
 			if high == 0 {
-				high = 2048
+				high = p.bpConfig.MaxTotalBytes * 8 / 10
 			}
 			if low == 0 || low >= high {
-				low = high / 2
+				low = high * 6 / 10
 			}
 
-			if !paused && stats.PendingFlushes >= int64(high) {
+			if !paused && stats.TotalBytes >= high {
 				consumer.PauseAll()
 				paused = true
 				logging.WarnLog("backpressure_pause", map[string]interface{}{
-					"pending": stats.PendingFlushes,
-					"high":    high,
+					"total_bytes": stats.TotalBytes,
+					"high_bytes":  high,
 				})
-			} else if paused && stats.PendingFlushes <= int64(low) {
+			} else if paused && stats.TotalBytes <= low {
 				consumer.ResumeAll()
 				paused = false
 				logging.InfoLog("backpressure_resume", map[string]interface{}{
-					"pending": stats.PendingFlushes,
-					"low":     low,
+					"total_bytes": stats.TotalBytes,
+					"low_bytes":   low,
 				})
 			}
 		case <-stop:

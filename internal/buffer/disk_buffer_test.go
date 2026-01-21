@@ -76,8 +76,8 @@ func TestBufferManagerFlushBySize(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -115,8 +115,8 @@ func TestBufferManagerTimeoutFromCreation(t *testing.T) {
 	maxAge := 80 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -165,8 +165,8 @@ func TestBufferManagerFlushesOnTimeout(t *testing.T) {
 	maxAge := 50 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -207,8 +207,8 @@ func TestBufferManagerPeriodicFlushesOnTimeout(t *testing.T) {
 	maxAge := 60 * time.Millisecond
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -247,8 +247,8 @@ func TestBufferManagerMaxTotalBytes(t *testing.T) {
 	// Very low MaxTotalBytes to trigger force flush
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    100,
-		HighWatermarkPending: 50,
-		LowWatermarkPending:  25,
+		HighWatermarkBytes:   80,
+		LowWatermarkBytes:    60,
 		MaxConcurrentFlushes: 2,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        100, // Very low - will trigger force flush
@@ -311,8 +311,8 @@ func TestBufferManagerStats(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 2,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -373,8 +373,8 @@ func TestBufferManagerFlushByBytes(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -417,9 +417,9 @@ func TestBufferManagerIsPressured(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    100,
-		HighWatermarkPending: 5,  // Low threshold for testing
-		LowWatermarkPending:  2,
-		MaxConcurrentFlushes: 1,  // Single worker to build up queue
+		HighWatermarkBytes:   200, // Low threshold for testing
+		LowWatermarkBytes:    100,
+		MaxConcurrentFlushes: 1, // Single worker to build up queue
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
 	}
@@ -454,8 +454,8 @@ func TestBufferManagerMultiplePartitions(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    100,
-		HighWatermarkPending: 50,
-		LowWatermarkPending:  25,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 4,
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,
@@ -543,7 +543,7 @@ func TestRetryWriteTriggersFlush(t *testing.T) {
 	onFlush := func(partitionPath string, buf *DiskBuffer, reason FlushReason) error {
 		if firstFlush {
 			firstFlush = false
-			close(firstFlushStarted) // Signal that first flush has started
+			close(firstFlushStarted)  // Signal that first flush has started
 			<-allowFirstFlushComplete // Block until we're ready
 		}
 		flushCh <- flushEvent{partition: partitionPath, reason: reason}
@@ -553,8 +553,8 @@ func TestRetryWriteTriggersFlush(t *testing.T) {
 
 	bp := BackpressureConfig{
 		MaxPendingFlushes:    10,
-		HighWatermarkPending: 8,
-		LowWatermarkPending:  4,
+		HighWatermarkBytes:   8 * 1024 * 1024,
+		LowWatermarkBytes:    6 * 1024 * 1024,
 		MaxConcurrentFlushes: 1, // Single worker to ensure predictable ordering
 		MaxOpenFiles:         10,
 		MaxTotalBytes:        10 * 1024 * 1024,

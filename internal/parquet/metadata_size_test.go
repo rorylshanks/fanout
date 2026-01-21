@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	goparquet "github.com/parquet-go/parquet-go"
-	"fanout/internal/config"
 )
 
 func TestParquetMetadataSizeTuning(t *testing.T) {
@@ -61,37 +60,6 @@ func TestParquetMetadataSizeTuning(t *testing.T) {
 	}
 }
 
-func TestPageBoundsMaxValueBytes(t *testing.T) {
-	events := []map[string]interface{}{
-		{
-			"small": "ok",
-			"big":   strings.Repeat("a", 64),
-		},
-		{
-			"small": "hi",
-			"big":   strings.Repeat("b", 64),
-		},
-	}
-
-	baseData := writeEventsWithConfig(t, events, 0)
-	limitedData := writeEventsWithConfig(t, events, 10)
-
-	baseBounds := columnIndexBoundsSizes(t, baseData)
-	limitedBounds := columnIndexBoundsSizes(t, limitedData)
-
-	if baseBounds["small"].minLen == 0 || baseBounds["small"].maxLen == 0 || baseBounds["big"].minLen == 0 || baseBounds["big"].maxLen == 0 {
-		t.Fatalf("expected base to include page bounds for both columns: %+v", baseBounds)
-	}
-	if limitedBounds["small"].minLen == 0 || limitedBounds["small"].maxLen == 0 {
-		t.Fatalf("expected small column to retain page bounds: %+v", limitedBounds)
-	}
-	if limitedBounds["big"].minLen != 0 || limitedBounds["big"].maxLen != 0 {
-		t.Fatalf("expected big column to skip page bounds: %+v", limitedBounds)
-	}
-
-	t.Logf("base footer=%d limited footer=%d", parquetFooterSize(t, baseData), parquetFooterSize(t, limitedData))
-}
-
 func rewriteParquetWithOptions(t *testing.T, path string, options ...goparquet.WriterOption) []byte {
 	t.Helper()
 
@@ -128,33 +96,6 @@ func rewriteParquetWithOptions(t *testing.T, path string, options ...goparquet.W
 		t.Fatalf("close writer: %v", err)
 	}
 
-	return buf.Bytes()
-}
-
-func writeEventsWithConfig(t *testing.T, events []map[string]interface{}, maxValueBytes int) []byte {
-	t.Helper()
-
-	useFileBufferPool := false
-	cfg := config.ParquetConfig{
-		Compression:             "zstd",
-		CompressionLevel:        5,
-		RowsPerFile:             10000,
-		MaxRowsPerRowGroup:      1000,
-		PageBufferBytes:         65536,
-		PageBoundsMaxValueBytes: maxValueBytes,
-		UseFileBufferPool:       &useFileBufferPool,
-		AllowNullableFields:     true,
-		Schema: map[string]config.SchemaField{
-			"big":   {Type: "utf8"},
-			"small": {Type: "utf8"},
-		},
-	}
-
-	writer := NewWriter(cfg, "")
-	var buf bytes.Buffer
-	if err := writer.WriteEvents(&buf, events); err != nil {
-		t.Fatalf("write events: %v", err)
-	}
 	return buf.Bytes()
 }
 

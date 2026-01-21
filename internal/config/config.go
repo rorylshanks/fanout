@@ -11,10 +11,10 @@ import (
 
 // Config represents the entire configuration file
 type Config struct {
-	DataDir string            `yaml:"data_dir"`
-	MetricsPort int           `yaml:"metrics_port"`
-	Sources map[string]Source `yaml:"sources"`
-	Sinks   map[string]Sink   `yaml:"sinks"`
+	DataDir     string            `yaml:"data_dir"`
+	MetricsPort int               `yaml:"metrics_port"`
+	Sources     map[string]Source `yaml:"sources"`
+	Sinks       map[string]Sink   `yaml:"sinks"`
 }
 
 // Source represents a Kafka source configuration
@@ -39,16 +39,16 @@ type TLSConfig struct {
 
 // Sink represents an output sink configuration
 type Sink struct {
-	Type              string        `yaml:"type"`
-	Inputs            []string      `yaml:"inputs"`
-	Bucket            string        `yaml:"bucket"`
-	Region            string        `yaml:"region"`
-	KeyPrefix         string        `yaml:"key_prefix"`
-	FilenameExtension string        `yaml:"filename_extension"`
-	Compression       string        `yaml:"compression"`
-	DiskBatching      DiskBatching  `yaml:"disk_batching"`
+	Type              string         `yaml:"type"`
+	Inputs            []string       `yaml:"inputs"`
+	Bucket            string         `yaml:"bucket"`
+	Region            string         `yaml:"region"`
+	KeyPrefix         string         `yaml:"key_prefix"`
+	FilenameExtension string         `yaml:"filename_extension"`
+	Compression       string         `yaml:"compression"`
+	DiskBatching      DiskBatching   `yaml:"disk_batching"`
 	Encoding          EncodingConfig `yaml:"encoding"`
-	Request           RequestConfig `yaml:"request"`
+	Request           RequestConfig  `yaml:"request"`
 	// For filesystem sink
 	Path string `yaml:"path"`
 }
@@ -76,12 +76,12 @@ type BackpressureConfig struct {
 	// MaxPendingFlushes is the maximum flush jobs in queue before blocking writes
 	// Default: 100
 	MaxPendingFlushes int `yaml:"max_pending_flushes"`
-	// HighWatermarkPending pauses ingestion when pending flushes exceed this value
-	// Default: 2048
-	HighWatermarkPending int `yaml:"high_watermark_pending"`
-	// LowWatermarkPending resumes ingestion when pending flushes fall below this value
-	// Default: 1024
-	LowWatermarkPending int `yaml:"low_watermark_pending"`
+	// HighWatermarkBytes pauses ingestion when total buffered bytes exceed this value
+	// Default: 80% of MaxTotalBytes
+	HighWatermarkBytes int64 `yaml:"high_watermark_bytes"`
+	// LowWatermarkBytes resumes ingestion when total buffered bytes fall below this value
+	// Default: 60% of MaxTotalBytes
+	LowWatermarkBytes int64 `yaml:"low_watermark_bytes"`
 	// MaxConcurrentFlushes is the number of parallel flush workers
 	// Default: 4
 	MaxConcurrentFlushes int `yaml:"max_concurrent_flushes"`
@@ -101,19 +101,18 @@ type EncodingConfig struct {
 
 // ParquetConfig represents parquet-specific settings
 type ParquetConfig struct {
-	Compression             string                    `yaml:"compression"`
-	CompressionLevel        int                       `yaml:"compression_level"`
-	RowsPerFile             int                       `yaml:"rows_per_file"`
-	MaxRowsPerRowGroup      int                       `yaml:"max_rows_per_row_group"`
-	PageBufferBytes         int                       `yaml:"page_buffer_bytes"`
-	PageBoundsMaxValueBytes int                       `yaml:"page_bounds_max_value_bytes"`
-	UseFileBufferPool       *bool                     `yaml:"use_file_buffer_pool"`
-	AllowNullableFields     bool                      `yaml:"allow_nullable_fields"`
-	UseMemoryMappedFiles    bool                      `yaml:"use_memory_mapped_files"`
-	SortingColumns          []SortingColumn           `yaml:"sorting_columns"`
-	JsonColumns             []JsonColumnConfig        `yaml:"json_columns"`
-	DynamicColumns          map[string]string         `yaml:"dynamic_columns"`
-	Schema                  map[string]SchemaField    `yaml:"schema"`
+	Compression          string                 `yaml:"compression"`
+	CompressionLevel     int                    `yaml:"compression_level"`
+	RowsPerFile          int                    `yaml:"rows_per_file"`
+	MaxRowsPerRowGroup   int                    `yaml:"max_rows_per_row_group"`
+	PageBufferBytes      int                    `yaml:"page_buffer_bytes"`
+	UseFileBufferPool    *bool                  `yaml:"use_file_buffer_pool"`
+	AllowNullableFields  bool                   `yaml:"allow_nullable_fields"`
+	UseMemoryMappedFiles bool                   `yaml:"use_memory_mapped_files"`
+	SortingColumns       []SortingColumn        `yaml:"sorting_columns"`
+	JsonColumns          []JsonColumnConfig     `yaml:"json_columns"`
+	DynamicColumns       map[string]string      `yaml:"dynamic_columns"`
+	Schema               map[string]SchemaField `yaml:"schema"`
 }
 
 // SortingColumn represents a column to sort by
@@ -147,10 +146,10 @@ type SchemaFieldWithName struct {
 
 // RequestConfig represents request/retry settings
 type RequestConfig struct {
-	Concurrency          int `yaml:"concurrency"`
-	InFlightLimit        int `yaml:"in_flight_limit"`
-	RetryInitialBackoff  int `yaml:"retry_initial_backoff_secs"`
-	RetryMaxDuration     int `yaml:"retry_max_duration_secs"`
+	Concurrency         int `yaml:"concurrency"`
+	InFlightLimit       int `yaml:"in_flight_limit"`
+	RetryInitialBackoff int `yaml:"retry_initial_backoff_secs"`
+	RetryMaxDuration    int `yaml:"retry_max_duration_secs"`
 }
 
 // Load reads and parses a configuration file
@@ -187,15 +186,6 @@ func Load(path string) (*Config, error) {
 		if sink.DiskBatching.Backpressure.MaxPendingFlushes == 0 {
 			sink.DiskBatching.Backpressure.MaxPendingFlushes = 100
 		}
-		if sink.DiskBatching.Backpressure.HighWatermarkPending == 0 {
-			sink.DiskBatching.Backpressure.HighWatermarkPending = 2048
-		}
-		if sink.DiskBatching.Backpressure.LowWatermarkPending == 0 {
-			sink.DiskBatching.Backpressure.LowWatermarkPending = 1024
-		}
-		if sink.DiskBatching.Backpressure.LowWatermarkPending >= sink.DiskBatching.Backpressure.HighWatermarkPending {
-			sink.DiskBatching.Backpressure.LowWatermarkPending = sink.DiskBatching.Backpressure.HighWatermarkPending / 2
-		}
 		if sink.DiskBatching.Backpressure.MaxConcurrentFlushes == 0 {
 			sink.DiskBatching.Backpressure.MaxConcurrentFlushes = 4
 		}
@@ -204,6 +194,15 @@ func Load(path string) (*Config, error) {
 		}
 		if sink.DiskBatching.Backpressure.MaxTotalBytes == 0 {
 			sink.DiskBatching.Backpressure.MaxTotalBytes = 50 * 1024 * 1024 * 1024 // 50GB total
+		}
+		if sink.DiskBatching.Backpressure.HighWatermarkBytes == 0 {
+			sink.DiskBatching.Backpressure.HighWatermarkBytes = sink.DiskBatching.Backpressure.MaxTotalBytes * 8 / 10
+		}
+		if sink.DiskBatching.Backpressure.LowWatermarkBytes == 0 {
+			sink.DiskBatching.Backpressure.LowWatermarkBytes = sink.DiskBatching.Backpressure.MaxTotalBytes * 6 / 10
+		}
+		if sink.DiskBatching.Backpressure.LowWatermarkBytes >= sink.DiskBatching.Backpressure.HighWatermarkBytes {
+			sink.DiskBatching.Backpressure.LowWatermarkBytes = sink.DiskBatching.Backpressure.HighWatermarkBytes * 6 / 10
 		}
 		if sink.Encoding.Parquet.RowsPerFile == 0 {
 			sink.Encoding.Parquet.RowsPerFile = 10000

@@ -453,9 +453,8 @@ func TestWriteEventsWithMinMaxIndexDisabled(t *testing.T) {
 
 func TestWriteEventsBucketColumnsSkipBounds(t *testing.T) {
 	cfg := config.ParquetConfig{
-		Compression:            "zstd",
-		AllowNullableFields:    true,
-		PageBoundsMaxValueBytes: 100, // Enable bounds checking
+		Compression:         "zstd",
+		AllowNullableFields: true,
 		Schema: map[string]config.SchemaField{
 			"uuid":       {Type: "utf8"},
 			"properties": {Type: "utf8"},

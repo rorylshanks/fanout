@@ -315,10 +315,10 @@ type BackpressureConfig struct {
 	// MaxPendingFlushes is the maximum number of flush jobs that can be queued
 	// When exceeded, Write() will block until space is available
 	MaxPendingFlushes int
-	// HighWatermarkPending pauses ingestion when pending flushes exceed this value
-	HighWatermarkPending int
-	// LowWatermarkPending resumes ingestion when pending flushes fall below this value
-	LowWatermarkPending int
+	// HighWatermarkBytes pauses ingestion when total buffered bytes exceed this value
+	HighWatermarkBytes int64
+	// LowWatermarkBytes resumes ingestion when total buffered bytes fall below this value
+	LowWatermarkBytes int64
 	// MaxConcurrentFlushes is the number of concurrent flush workers
 	MaxConcurrentFlushes int
 	// MaxOpenFiles is the LRU cache size for open file handles
@@ -330,13 +330,14 @@ type BackpressureConfig struct {
 
 // DefaultBackpressureConfig returns sensible defaults
 func DefaultBackpressureConfig() BackpressureConfig {
+	maxTotalBytes := int64(50 * 1024 * 1024 * 1024) // 50GB
 	return BackpressureConfig{
 		MaxPendingFlushes:    100,
-		HighWatermarkPending: 2048,
-		LowWatermarkPending:  1024,
+		HighWatermarkBytes:   maxTotalBytes * 8 / 10,
+		LowWatermarkBytes:    maxTotalBytes * 6 / 10,
 		MaxConcurrentFlushes: 4,
 		MaxOpenFiles:         256,
-		MaxTotalBytes:        50 * 1024 * 1024 * 1024, // 50GB
+		MaxTotalBytes:        maxTotalBytes,
 	}
 }
 
@@ -753,10 +754,10 @@ func (m *BufferManager) FlushAll() error {
 	for i, path := range paths {
 		if err := m.queueFlushWithReason(path, FlushReasonForce); err != nil {
 			logging.ErrorLog("flush_all_queue_failed", map[string]interface{}{
-				"path":   path,
-				"index":  i,
-				"total":  len(paths),
-				"error":  err.Error(),
+				"path":  path,
+				"index": i,
+				"total": len(paths),
+				"error": err.Error(),
 			})
 			return err
 		}
@@ -903,9 +904,9 @@ func (m *BufferManager) Stats() BufferManagerStats {
 // IsPressured returns true if backpressure is being applied
 func (m *BufferManager) IsPressured() bool {
 	stats := m.Stats()
-	high := m.backpressure.HighWatermarkPending
+	high := m.backpressure.HighWatermarkBytes
 	if high == 0 {
-		high = 2048
+		high = m.backpressure.MaxTotalBytes * 8 / 10
 	}
-	return stats.PendingFlushes >= int64(high)
+	return stats.TotalBytes >= high
 }

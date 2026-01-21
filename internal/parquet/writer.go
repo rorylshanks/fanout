@@ -336,24 +336,9 @@ func (w *Writer) writeParquetDirect(out io.Writer, events []map[string]interface
 		// Benchmark: 4.45MB -> 1.14MB (3.9x smaller, even smaller than ClickHouse output)
 		goparquet.DefaultEncoding(&goparquet.RLEDictionary),
 	}
-	if w.config.PageBoundsMaxValueBytes > 0 {
-		skipBounds := w.columnsExceedingPageBounds(events, columns, jsonPlans, jsonProcessors, w.config.PageBoundsMaxValueBytes)
-		for _, col := range columns {
-			if col.bucketIdx >= 0 || col.isJsonKeys || col.skipBounds {
-				if skipBounds == nil {
-					skipBounds = make(map[string]struct{})
-				}
-				skipBounds[col.name] = struct{}{}
-			}
-		}
-		for name := range skipBounds {
-			writerOptions = append(writerOptions, goparquet.SkipPageBounds(name))
-		}
-	} else {
-		for _, col := range columns {
-			if col.bucketIdx >= 0 || col.isJsonKeys || col.skipBounds {
-				writerOptions = append(writerOptions, goparquet.SkipPageBounds(col.name))
-			}
+	for _, col := range columns {
+		if col.bucketIdx >= 0 || col.isJsonKeys || col.skipBounds {
+			writerOptions = append(writerOptions, goparquet.SkipPageBounds(col.name))
 		}
 	}
 	if w.config.MaxRowsPerRowGroup > 0 {
@@ -649,112 +634,6 @@ func (w *Writer) toParquetValueFast(val interface{}, fieldType string, columnInd
 			return goparquet.ValueOf(s)
 		}
 		return goparquet.ValueOf("")
-	}
-}
-
-func (w *Writer) columnsExceedingPageBounds(events []map[string]interface{}, columns []columnInfo, jsonPlans map[string]*jsonexpand.JsonColumnPlan, jsonProcessors map[string]*jsonexpand.JsonColumnProcessor, maxBytes int) map[string]struct{} {
-	if maxBytes <= 0 {
-		return nil
-	}
-
-	checkCols := make([]columnInfo, 0, len(columns))
-	needsJSON := false
-	for _, col := range columns {
-		if col.skipBounds || col.bucketIdx >= 0 || col.isJsonKeys {
-			continue
-		}
-		if !isBoundsSizedType(col.fieldType) {
-			continue
-		}
-		checkCols = append(checkCols, col)
-		if col.isJsonSubcol {
-			needsJSON = true
-		}
-	}
-	if len(checkCols) == 0 {
-		return nil
-	}
-
-	exceeded := make(map[string]struct{})
-	for _, event := range events {
-		var rowJson map[string]*jsonexpand.RowExpansion
-		if needsJSON && len(jsonPlans) > 0 {
-			rowJson = make(map[string]*jsonexpand.RowExpansion, len(jsonPlans))
-			for colName, plan := range jsonPlans {
-				if proc := jsonProcessors[colName]; proc != nil {
-					if v, ok := event[colName]; ok {
-						if s, ok := v.(string); ok && s != "" {
-							rowJson[colName] = proc.ExpandRow(plan, s)
-						}
-					}
-				}
-			}
-		}
-
-		for _, col := range checkCols {
-			if _, ok := exceeded[col.name]; ok {
-				continue
-			}
-			val := valueForColumn(event, col, rowJson)
-			if val == nil {
-				continue
-			}
-			if valueSizeBytes(val) > maxBytes {
-				exceeded[col.name] = struct{}{}
-				if len(exceeded) == len(checkCols) {
-					return exceeded
-				}
-			}
-		}
-	}
-
-	return exceeded
-}
-
-func isBoundsSizedType(fieldType string) bool {
-	switch fieldType {
-	case "utf8", "string", "json":
-		return true
-	default:
-		return false
-	}
-}
-
-func valueForColumn(event map[string]interface{}, col columnInfo, rowJson map[string]*jsonexpand.RowExpansion) interface{} {
-	if !col.isJsonSubcol {
-		return event[col.name]
-	}
-	if col.isJsonKeys {
-		if expanded := rowJson[col.jsonColName]; expanded != nil {
-			return expanded.JsonKeys
-		}
-		return nil
-	}
-	if col.bucketIdx >= 0 {
-		if expanded := rowJson[col.jsonColName]; expanded != nil {
-			if bucketData := expanded.BucketValues[col.bucketIdx]; bucketData != nil {
-				return bucketData
-			}
-		}
-		return nil
-	}
-	if expanded := rowJson[col.jsonColName]; expanded != nil {
-		if subcolValue, ok := expanded.SubcolumnValues[col.subcolName]; ok && subcolValue != nil {
-			return subcolValue
-		}
-	}
-	return nil
-}
-
-func valueSizeBytes(val interface{}) int {
-	switch v := val.(type) {
-	case string:
-		return len(v)
-	case []byte:
-		return len(v)
-	default:
-		b, _ := json.Marshal(val)
-		return len(b)
 	}
 }
 
